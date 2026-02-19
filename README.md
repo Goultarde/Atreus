@@ -6,7 +6,7 @@ hash-based API resolution, ntdll unhook, ETW/AMSI patching, and sandbox detectio
 
 ### Installation
 ```bash
-sudo ./mythic-cli install folder ../agents/Atreus
+sudo ./mythic-cli install folder Atreus
 ```
 
 ### Usage
