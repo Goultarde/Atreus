@@ -1,6 +1,6 @@
 # Atreus Shellcode Loader
 
-**Atreus** is a shellcode loader wrapper for **Kratos** and other Mythic payloads.
+**Atreus** is a shellcode loader wrapper for **[Kratos](https://github.com/Goultarde/kratos)** and other Mythic payloads.
 Injects shellcode via Early Bird APC or thread hijacking with RC4/XOR encryption,
 hash-based API resolution, ntdll unhook, ETW/AMSI patching, and sandbox detection.
 
