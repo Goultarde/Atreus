@@ -96,7 +96,7 @@ class Atreus(PayloadType):
             name="injection_technique",
             parameter_type=BuildParameterType.ChooseOne,
             description="Injection technique: Early Bird APC (new suspended process), Thread Hijack (RIP redirect), Process Hollowing (unmap + RIP), or Remote Thread (NtCreateThreadEx in existing process - target_process must be a process name like svchost.exe)",
-            choices=["self_injection", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing"],
+            choices=["self_injection", "fiber_injection", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing"],
             default_value="early_bird_apc",
         ),
         BuildParameter(
@@ -196,6 +196,8 @@ class Atreus(PayloadType):
             defines.append("-DUSE_REMOTE_THREAD")
         elif injection_technique == "self_injection":
             defines.append("-DUSE_SELF_INJECT")
+        elif injection_technique == "fiber_injection":
+            defines.append("-DUSE_FIBER_INJECT")
         if wipe_memory:
             defines.append("-DUSE_WIPE")
 
@@ -247,6 +249,7 @@ class Atreus(PayloadType):
                 elif injection_technique == "process_hollowing": features.append("process-hollowing")
                 elif injection_technique == "remote_injection":  features.append("remote-injection")
                 elif injection_technique == "self_injection":    features.append("self-injection")
+                elif injection_technique == "fiber_injection":   features.append("fiber-injection")
                 else:                                            features.append("early-bird-apc")
                 if wipe_memory:      features.append("wipe")
                 if debug_mode:       features.append("DEBUG")

