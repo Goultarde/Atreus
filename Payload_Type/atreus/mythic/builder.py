@@ -205,6 +205,12 @@ class Atreus(PayloadType):
         if debug_mode:
             defines.append("-DATREUS_DEBUG")
 
+        # DEBUG: log raw parameter value and final defines
+        raw_inj = self.get_parameter("injection_technique")
+        logging.error(f"[ATREUS-DEBUG] raw injection_technique = {repr(raw_inj)}")
+        logging.error(f"[ATREUS-DEBUG] resolved injection_technique = {repr(injection_technique)}")
+        logging.error(f"[ATREUS-DEBUG] defines = {defines}")
+
         with tempfile.TemporaryDirectory() as tmp:
             src_path = os.path.join(tmp, "Atreus_Main.cpp")
             exe_path = os.path.join(tmp, "Atreus.exe")
@@ -253,6 +259,10 @@ class Atreus(PayloadType):
                 else:                                            features.append("early-bird-apc")
                 if wipe_memory:      features.append("wipe")
                 if debug_mode:       features.append("DEBUG")
-                resp.message = f"Atreus [{', '.join(features)}] -> {target_process}"
+                resp.message = (
+                    f"Atreus [{', '.join(features)}] -> {target_process}\n"
+                    f"[DBG] raw_param={repr(raw_inj)} resolved={repr(injection_technique)}\n"
+                    f"[DBG] defines={' '.join(defines)}"
+                )
 
         return resp

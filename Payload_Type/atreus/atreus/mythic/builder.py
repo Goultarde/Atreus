@@ -96,7 +96,7 @@ class Atreus(PayloadType):
             name="injection_technique",
             parameter_type=BuildParameterType.ChooseOne,
             description="Injection technique: Early Bird APC (new suspended process), Thread Hijack (RIP redirect), Process Hollowing (unmap + RIP), or Remote Thread (NtCreateThreadEx in existing process - target_process must be a process name like svchost.exe)",
-            choices=["self_injection", "fiber_injection", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing"],
+            choices=["self_injection", "fiber_injection", "module_stomping", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing"],
             default_value="early_bird_apc",
         ),
         BuildParameter(
@@ -198,12 +198,20 @@ class Atreus(PayloadType):
             defines.append("-DUSE_SELF_INJECT")
         elif injection_technique == "fiber_injection":
             defines.append("-DUSE_FIBER_INJECT")
+        elif injection_technique == "module_stomping":
+            defines.append("-DUSE_MODULE_STOMP")
         if wipe_memory:
             defines.append("-DUSE_WIPE")
 
         extra_libs = ""
         if debug_mode:
             defines.append("-DATREUS_DEBUG")
+
+        # DEBUG: log raw parameter value and final defines
+        raw_inj = self.get_parameter("injection_technique")
+        logging.error(f"[ATREUS-DEBUG] raw injection_technique = {repr(raw_inj)}")
+        logging.error(f"[ATREUS-DEBUG] resolved injection_technique = {repr(injection_technique)}")
+        logging.error(f"[ATREUS-DEBUG] defines = {defines}")
 
         with tempfile.TemporaryDirectory() as tmp:
             src_path = os.path.join(tmp, "Atreus_Main.cpp")
@@ -250,9 +258,14 @@ class Atreus(PayloadType):
                 elif injection_technique == "remote_injection":  features.append("remote-injection")
                 elif injection_technique == "self_injection":    features.append("self-injection")
                 elif injection_technique == "fiber_injection":   features.append("fiber-injection")
+                elif injection_technique == "module_stomping":   features.append("module-stomping")
                 else:                                            features.append("early-bird-apc")
                 if wipe_memory:      features.append("wipe")
                 if debug_mode:       features.append("DEBUG")
-                resp.message = f"Atreus [{', '.join(features)}] -> {target_process}"
+                resp.message = (
+                    f"Atreus [{', '.join(features)}] -> {target_process}\n"
+                    f"[DBG] raw_param={repr(raw_inj)} resolved={repr(injection_technique)}\n"
+                    f"[DBG] defines={' '.join(defines)}"
+                )
 
         return resp
